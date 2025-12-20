@@ -2,6 +2,12 @@
 
 A Pi agent hook that enables rewinding file changes during coding sessions. Creates automatic checkpoints using git refs, allowing you to restore files to previous states while optionally preserving conversation history.
 
+## Screenshots
+
+![Selecting a message to branch from](rewind1.png)
+
+![Choosing a restore option](rewind2.png)
+
 ## Requirements
 
 - Pi agent v0.18.0+
