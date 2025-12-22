@@ -52,7 +52,8 @@ export default function (pi: HookAPI) {
     }
   });
 
-  pi.on("branch", async (event, ctx) => {
+  pi.on("session", async (event, ctx) => {
+    if (event.reason !== "before_branch") return;
     if (!ctx.hasUI) return;
 
     let checkpointId = checkpoints.get(event.targetTurnIndex);
@@ -87,7 +88,7 @@ export default function (pi: HookAPI) {
 
     if (!choice) {
       ctx.ui.notify("Rewind cancelled", "info");
-      return { skipConversationRestore: true };
+      return { cancel: true };
     }
 
     if (choice.startsWith("Conversation only")) {
@@ -107,11 +108,11 @@ export default function (pi: HookAPI) {
     } catch (err) {
       console.error(`[rewind] Failed to restore: ${err}`);
       ctx.ui.notify(`Failed to restore files: ${err}`, "error");
-      return { skipConversationRestore: true };
+      return { cancel: true };
     }
 
     if (choice.includes("files only") || choice.startsWith("Code only")) {
-      return { skipConversationRestore: true };
+      return { cancel: true };
     }
 
     return undefined;
