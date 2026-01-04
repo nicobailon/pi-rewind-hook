@@ -1,4 +1,13 @@
-import type { HookAPI } from "@mariozechner/pi-coding-agent/hooks";
+/**
+ * Rewind Hook - Git-based file restoration for pi branching
+ *
+ * Creates worktree snapshots at each turn so /branch can restore code state.
+ * Supports: restore files + conversation, files only, conversation only, undo last restore.
+ *
+ * Updated for pi-coding-agent v0.31+ (granular session events API)
+ */
+
+import type { HookAPI } from "@mariozechner/pi-coding-agent";
 import { exec as execCb } from "child_process";
 import { mkdtemp, rm } from "fs/promises";
 import { tmpdir } from "os";
@@ -14,7 +23,8 @@ const MAX_CHECKPOINTS = 100;
 type ExecFn = (cmd: string, args: string[]) => Promise<{ stdout: string; stderr: string; code: number }>;
 
 export default function (pi: HookAPI) {
-  const checkpoints = new Map<number, string>();
+  const checkpoints = new Map<string, string>();
+  let currentEntryId: string | undefined;
   let resumeCheckpoint: string | null = null;
   let repoRoot: string | null = null;
   let isGitRepo = false;
@@ -71,7 +81,7 @@ export default function (pi: HookAPI) {
   async function restoreWithBackup(
     exec: ExecFn,
     targetRef: string,
-    notify: (msg: string, level: "success" | "error" | "info") => void
+    notify: (msg: string, level: "info" | "warning" | "error") => void
   ): Promise<boolean> {
     try {
       const existingBackup = await findBeforeRestoreRef(exec);
@@ -113,12 +123,38 @@ export default function (pi: HookAPI) {
     }
   }
 
-  pi.on("session", async (event, ctx) => {
-    if (event.reason !== "start") return;
+  async function pruneCheckpoints(exec: ExecFn) {
+    try {
+      const result = await exec("git", [
+        "for-each-ref",
+        "--sort=creatordate",
+        "--format=%(refname)",
+        REF_PREFIX,
+      ]);
+
+      const refs = result.stdout.trim().split("\n").filter(Boolean);
+      const currentResumeRef = resumeCheckpoint ? `${REF_PREFIX}${resumeCheckpoint}` : null;
+      const checkpointRefs = refs.filter(r =>
+        !r.includes(BEFORE_RESTORE_PREFIX) && r !== currentResumeRef
+      );
+
+      if (checkpointRefs.length > MAX_CHECKPOINTS) {
+        const toDelete = checkpointRefs.slice(0, checkpointRefs.length - MAX_CHECKPOINTS);
+        for (const ref of toDelete) {
+          await exec("git", ["update-ref", "-d", ref]);
+          console.error(`[rewind] Pruned old checkpoint: ${ref}`);
+        }
+      }
+    } catch (err) {
+      console.error(`[rewind] Failed to prune checkpoints: ${err}`);
+    }
+  }
+
+  pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;
 
     try {
-      const result = await ctx.exec("git", ["rev-parse", "--is-inside-work-tree"]);
+      const result = await pi.exec("git", ["rev-parse", "--is-inside-work-tree"]);
       isGitRepo = result.stdout.trim() === "true";
     } catch {
       isGitRepo = false;
@@ -129,7 +165,7 @@ export default function (pi: HookAPI) {
     const checkpointId = `checkpoint-resume-${Date.now()}`;
 
     try {
-      const success = await createCheckpointFromWorktree(ctx.exec, checkpointId);
+      const success = await createCheckpointFromWorktree(pi.exec, checkpointId);
       if (success) {
         resumeCheckpoint = checkpointId;
         console.error(`[rewind] Created resume checkpoint: ${checkpointId}`);
@@ -139,6 +175,11 @@ export default function (pi: HookAPI) {
     }
   });
 
+  pi.on("tool_result", async (_event, ctx) => {
+    const leaf = ctx.sessionManager.getLeafEntry();
+    if (leaf) currentEntryId = leaf.id;
+  });
+
   pi.on("turn_start", async (event, ctx) => {
     if (!ctx.hasUI) return;
     if (!isGitRepo) return;
@@ -146,25 +187,30 @@ export default function (pi: HookAPI) {
     const checkpointId = `checkpoint-${event.timestamp}`;
 
     try {
-      const success = await createCheckpointFromWorktree(ctx.exec, checkpointId);
-      if (success) {
-        checkpoints.set(event.turnIndex, checkpointId);
+      const success = await createCheckpointFromWorktree(pi.exec, checkpointId);
+      if (success && currentEntryId) {
+        checkpoints.set(currentEntryId, checkpointId);
         console.error(
-          `[rewind] Created checkpoint ${checkpointId} for turn ${event.turnIndex}`
+          `[rewind] Created checkpoint ${checkpointId} for entry ${currentEntryId}`
         );
-        await pruneCheckpoints(ctx.exec);
+        await pruneCheckpoints(pi.exec);
       }
     } catch (err) {
       console.error(`[rewind] Failed to create checkpoint: ${err}`);
     }
   });
 
-  pi.on("session", async (event, ctx) => {
-    if (event.reason !== "before_branch") return;
+  pi.on("session_before_branch", async (event, ctx) => {
     if (!ctx.hasUI) return;
-    if (!isGitRepo) return;
 
-    let checkpointId = checkpoints.get(event.targetTurnIndex);
+    try {
+      const result = await pi.exec("git", ["rev-parse", "--is-inside-work-tree"]);
+      if (result.stdout.trim() !== "true") return;
+    } catch {
+      return;
+    }
+
+    let checkpointId = checkpoints.get(event.entryId);
     let usingResumeCheckpoint = false;
 
     if (!checkpointId && resumeCheckpoint) {
@@ -172,7 +218,7 @@ export default function (pi: HookAPI) {
       usingResumeCheckpoint = true;
     }
 
-    const beforeRestoreRef = await findBeforeRestoreRef(ctx.exec);
+    const beforeRestoreRef = await findBeforeRestoreRef(pi.exec);
     const hasUndo = !!beforeRestoreRef;
 
     if (!checkpointId && !hasUndo) {
@@ -184,7 +230,7 @@ export default function (pi: HookAPI) {
     }
 
     const options: string[] = [];
-    
+
     if (checkpointId) {
       if (usingResumeCheckpoint) {
         options.push("Restore to session start (files + conversation)");
@@ -217,28 +263,28 @@ export default function (pi: HookAPI) {
 
     if (choice === "Undo last file rewind") {
       const success = await restoreWithBackup(
-        ctx.exec,
+        pi.exec,
         beforeRestoreRef!.commitSha,
         ctx.ui.notify.bind(ctx.ui)
       );
       if (success) {
-        ctx.ui.notify("Files restored to before last rewind", "success");
+        ctx.ui.notify("Files restored to before last rewind", "info");
       }
-      return { skipConversationRestore: true };
+      return { cancel: true };
     }
 
     const ref = `${REF_PREFIX}${checkpointId}`;
     const success = await restoreWithBackup(
-      ctx.exec,
+      pi.exec,
       ref,
       ctx.ui.notify.bind(ctx.ui)
     );
     if (success) {
       ctx.ui.notify(
-        usingResumeCheckpoint 
-          ? "Files restored to session start" 
+        usingResumeCheckpoint
+          ? "Files restored to session start"
           : "Files restored from checkpoint",
-        "success"
+        "info"
       );
     }
 
@@ -247,30 +293,87 @@ export default function (pi: HookAPI) {
     }
   });
 
-  async function pruneCheckpoints(exec: ExecFn) {
+  pi.on("session_before_tree", async (event, ctx) => {
+    if (!ctx.hasUI) return;
+
     try {
-      const result = await exec("git", [
-        "for-each-ref",
-        "--sort=creatordate",
-        "--format=%(refname)",
-        REF_PREFIX,
-      ]);
-
-      const refs = result.stdout.trim().split("\n").filter(Boolean);
-      const currentResumeRef = resumeCheckpoint ? `${REF_PREFIX}${resumeCheckpoint}` : null;
-      const checkpointRefs = refs.filter(r => 
-        !r.includes(BEFORE_RESTORE_PREFIX) && r !== currentResumeRef
-      );
-
-      if (checkpointRefs.length > MAX_CHECKPOINTS) {
-        const toDelete = checkpointRefs.slice(0, checkpointRefs.length - MAX_CHECKPOINTS);
-        for (const ref of toDelete) {
-          await exec("git", ["update-ref", "-d", ref]);
-          console.error(`[rewind] Pruned old checkpoint: ${ref}`);
-        }
-      }
-    } catch (err) {
-      console.error(`[rewind] Failed to prune checkpoints: ${err}`);
+      const result = await pi.exec("git", ["rev-parse", "--is-inside-work-tree"]);
+      if (result.stdout.trim() !== "true") return;
+    } catch {
+      return;
     }
-  }
+
+    const targetId = event.preparation.targetId;
+    let checkpointId = checkpoints.get(targetId);
+    let usingResumeCheckpoint = false;
+
+    if (!checkpointId && resumeCheckpoint) {
+      checkpointId = resumeCheckpoint;
+      usingResumeCheckpoint = true;
+    }
+
+    const beforeRestoreRef = await findBeforeRestoreRef(pi.exec);
+    const hasUndo = !!beforeRestoreRef;
+
+    if (!checkpointId && !hasUndo) {
+      ctx.ui.notify("No checkpoint available for this message", "info");
+      return;
+    }
+
+    const options: string[] = [];
+
+    if (checkpointId) {
+      if (usingResumeCheckpoint) {
+        options.push("Restore files to session start");
+      } else {
+        options.push("Restore files to that point");
+      }
+      options.push("Keep current files");
+    }
+
+    if (hasUndo) {
+      options.push("Undo last file rewind");
+    }
+
+    options.push("Cancel navigation");
+
+    const choice = await ctx.ui.select("Restore Options", options);
+
+    if (!choice || choice === "Cancel navigation") {
+      ctx.ui.notify("Navigation cancelled", "info");
+      return { cancel: true };
+    }
+
+    if (choice === "Keep current files") {
+      return;
+    }
+
+    if (choice === "Undo last file rewind") {
+      const success = await restoreWithBackup(
+        pi.exec,
+        beforeRestoreRef!.commitSha,
+        ctx.ui.notify.bind(ctx.ui)
+      );
+      if (success) {
+        ctx.ui.notify("Files restored to before last rewind", "info");
+      }
+      return { cancel: true };
+    }
+
+    const ref = `${REF_PREFIX}${checkpointId}`;
+    const success = await restoreWithBackup(
+      pi.exec,
+      ref,
+      ctx.ui.notify.bind(ctx.ui)
+    );
+    if (success) {
+      ctx.ui.notify(
+        usingResumeCheckpoint
+          ? "Files restored to session start"
+          : "Files restored to checkpoint",
+        "info"
+      );
+    }
+  });
+
 }

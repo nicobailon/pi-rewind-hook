@@ -10,7 +10,7 @@ A Pi agent hook that enables rewinding file changes during coding sessions. Crea
 
 ## Requirements
 
-- Pi agent v0.18.0+
+- Pi agent v0.31+
 - Node.js (for installation)
 - Git repository (checkpoints are stored as git refs)
 
@@ -68,11 +68,17 @@ Checkpoints are stored as git refs under `refs/pi-checkpoints/` and are pruned t
 
 ### Rewinding
 
-To rewind:
+To rewind via `/branch`:
 
 1. Type `/branch` in pi
 2. Select a message to branch from
-3. Choose a restore option:
+3. Choose a restore option
+
+To rewind via tree navigation:
+
+1. Press `Tab` to open the session tree
+2. Navigate to a different node
+3. Choose a restore option
 
 **For messages from the current session:**
 
@@ -81,6 +87,7 @@ To rewind:
 | **Restore all (files + conversation)** | Restored | Reset to that point |
 | **Conversation only (keep current files)** | Unchanged | Reset to that point |
 | **Code only (restore files, keep conversation)** | Restored | Unchanged |
+| **Undo last file rewind** | Restored to before last rewind | Unchanged |
 
 **For messages from before the current session (uses resume checkpoint):**
 
@@ -89,6 +96,7 @@ To rewind:
 | **Restore to session start (files + conversation)** | Restored to session start | Reset to that point |
 | **Conversation only (keep current files)** | Unchanged | Reset to that point |
 | **Restore to session start (files only, keep conversation)** | Restored to session start | Unchanged |
+| **Undo last file rewind** | Restored to before last rewind | Unchanged |
 
 ### Resumed Sessions
 
