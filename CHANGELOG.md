@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.0] - 2026-01-08
+
+### Fixed
+- **Critical**: Checkpoints now persist across session resumes - entry IDs are embedded in git ref names and rebuilt on session start
+- **Critical**: Fixed checkpoint being associated with wrong entry ID (was using previous assistant entry instead of current user entry)
+- **Critical**: Pruning no longer incorrectly removes Map entries for newer checkpoints when deleting older ones for same entry
+- Tree navigation now always shows options menu (even when no checkpoint available)
+- Branch now offers "Conversation only" option even when no checkpoint is available
+
+### Changed
+- Checkpoint ref format now includes entry ID: `checkpoint-{timestamp}-{entryId}`
+- Added `rebuildCheckpointsMap()` to reconstruct entry→checkpoint mappings from git refs
+- Use leaf entry at `turn_start` (the user message) instead of tracking via `tool_result`
+- Added `--sort=creatordate` to `for-each-ref` calls for consistent ordering
+- Removed unused `tool_result` handler
+
 ## [1.3.0] - 2026-01-05
 
 ### Breaking Changes

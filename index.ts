@@ -22,14 +22,65 @@ const MAX_CHECKPOINTS = 100;
 
 type ExecFn = (cmd: string, args: string[]) => Promise<{ stdout: string; stderr: string; code: number }>;
 
+/**
+ * Sanitize entry ID for use in git ref names.
+ * Git refs can't contain: space, ~, ^, :, ?, *, [, \, or control chars.
+ * Entry IDs are typically alphanumeric but we sanitize just in case.
+ */
+function sanitizeForRef(id: string): string {
+  return id.replace(/[^a-zA-Z0-9-]/g, "_");
+}
+
 export default function (pi: ExtensionAPI) {
   const checkpoints = new Map<string, string>();
-  let currentEntryId: string | undefined;
   let resumeCheckpoint: string | null = null;
   let repoRoot: string | null = null;
   let isGitRepo = false;
 
   console.error(`[rewind] Extension loaded`);
+
+  /**
+   * Rebuild the checkpoints map from existing git refs.
+   * Parses refs like `checkpoint-{timestamp}-{entryId}` to reconstruct the mapping.
+   * This allows checkpoint restoration to work across session resumes.
+   */
+  async function rebuildCheckpointsMap(exec: ExecFn): Promise<void> {
+    try {
+      const result = await exec("git", [
+        "for-each-ref",
+        "--sort=creatordate",
+        "--format=%(refname)",
+        REF_PREFIX,
+      ]);
+
+      const refs = result.stdout.trim().split("\n").filter(Boolean);
+
+      for (const ref of refs) {
+        // Get checkpoint ID by removing prefix
+        const checkpointId = ref.replace(REF_PREFIX, "");
+
+        // Skip non-checkpoint refs (before-restore, resume)
+        if (!checkpointId.startsWith("checkpoint-")) continue;
+        if (checkpointId.startsWith("checkpoint-resume-")) continue;
+
+        // Parse: checkpoint-{timestamp}-{entryId}
+        // Timestamp is always numeric (13 digits for ms since epoch)
+        // Entry ID comes after the timestamp, may contain hyphens
+        const match = checkpointId.match(/^checkpoint-(\d+)-(.+)$/);
+        if (match) {
+          const entryId = match[2];
+          // Only keep the most recent checkpoint for each entry (Map overwrites)
+          checkpoints.set(entryId, checkpointId);
+        }
+      }
+
+      if (checkpoints.size > 0) {
+        console.error(`[rewind] Rebuilt checkpoints map: ${checkpoints.size} entries`);
+      }
+    } catch (err) {
+      console.error(`[rewind] Failed to rebuild checkpoints map: ${err}`);
+    }
+  }
 
   async function findBeforeRestoreRef(exec: ExecFn): Promise<{ refName: string; commitSha: string } | null> {
     try {
@@ -133,9 +184,10 @@ export default function (pi: ExtensionAPI) {
       ]);
 
       const refs = result.stdout.trim().split("\n").filter(Boolean);
-      const currentResumeRef = resumeCheckpoint ? `${REF_PREFIX}${resumeCheckpoint}` : null;
+      // Filter to only regular checkpoints (not backups or resume checkpoints)
       const checkpointRefs = refs.filter(r =>
-        !r.includes(BEFORE_RESTORE_PREFIX) && r !== currentResumeRef
+        !r.includes(BEFORE_RESTORE_PREFIX) &&
+        !r.includes("checkpoint-resume-")
       );
 
       if (checkpointRefs.length > MAX_CHECKPOINTS) {
@@ -143,6 +195,17 @@ export default function (pi: ExtensionAPI) {
         for (const ref of toDelete) {
           await exec("git", ["update-ref", "-d", ref]);
           console.error(`[rewind] Pruned old checkpoint: ${ref}`);
+
+          // Remove from in-memory map ONLY if this is the currently mapped checkpoint.
+          // There might be a newer checkpoint for the same entry that we're keeping.
+          const checkpointId = ref.replace(REF_PREFIX, "");
+          const match = checkpointId.match(/^checkpoint-(\d+)-(.+)$/);
+          if (match) {
+            const entryId = match[2];
+            if (checkpoints.get(entryId) === checkpointId) {
+              checkpoints.delete(entryId);
+            }
+          }
         }
       }
     } catch (err) {
@@ -162,6 +225,10 @@ export default function (pi: ExtensionAPI) {
 
     if (!isGitRepo) return;
 
+    // Rebuild checkpoints map from existing git refs (for resumed sessions)
+    await rebuildCheckpointsMap(pi.exec);
+
+    // Create a resume checkpoint for the current state
     const checkpointId = `checkpoint-resume-${Date.now()}`;
 
     try {
@@ -175,24 +242,30 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("tool_result", async (_event, ctx) => {
-    const leaf = ctx.sessionManager.getLeafEntry();
-    if (leaf) currentEntryId = leaf.id;
-  });
-
   pi.on("turn_start", async (event, ctx) => {
     if (!ctx.hasUI) return;
     if (!isGitRepo) return;
 
-    const checkpointId = `checkpoint-${event.timestamp}`;
+    // Get the current leaf entry - at turn_start, this is the USER message
+    // that triggered this turn. Associate checkpoint with this entry so
+    // navigating to this message restores files to this point.
+    const leaf = ctx.sessionManager.getLeafEntry();
+    if (!leaf) {
+      console.error(`[rewind] No leaf entry available, skipping checkpoint creation`);
+      return;
+    }
+
+    // Include entry ID in checkpoint name for persistence across sessions
+    // Format: checkpoint-{timestamp}-{entryId}
+    const entryId = leaf.id;
+    const sanitizedEntryId = sanitizeForRef(entryId);
+    const checkpointId = `checkpoint-${event.timestamp}-${sanitizedEntryId}`;
 
     try {
       const success = await createCheckpointFromWorktree(pi.exec, checkpointId);
-      if (success && currentEntryId) {
-        checkpoints.set(currentEntryId, checkpointId);
-        console.error(
-          `[rewind] Created checkpoint ${checkpointId} for entry ${currentEntryId}`
-        );
+      if (success) {
+        checkpoints.set(sanitizedEntryId, checkpointId);
+        console.error(`[rewind] Created checkpoint ${checkpointId} for entry ${entryId}`);
         await pruneCheckpoints(pi.exec);
       }
     } catch (err) {
@@ -210,7 +283,8 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    let checkpointId = checkpoints.get(event.entryId);
+    const sanitizedEntryId = sanitizeForRef(event.entryId);
+    let checkpointId = checkpoints.get(sanitizedEntryId);
     let usingResumeCheckpoint = false;
 
     if (!checkpointId && resumeCheckpoint) {
@@ -220,14 +294,6 @@ export default function (pi: ExtensionAPI) {
 
     const beforeRestoreRef = await findBeforeRestoreRef(pi.exec);
     const hasUndo = !!beforeRestoreRef;
-
-    if (!checkpointId && !hasUndo) {
-      ctx.ui.notify(
-        "No checkpoint available for this message",
-        "info"
-      );
-      return;
-    }
 
     const options: string[] = [];
 
@@ -241,6 +307,9 @@ export default function (pi: ExtensionAPI) {
         options.push("Conversation only (keep current files)");
         options.push("Code only (restore files, keep conversation)");
       }
+    } else {
+      // No checkpoint available - still allow conversation-only branch
+      options.push("Conversation only (keep current files)");
     }
 
     if (hasUndo) {
@@ -304,7 +373,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     const targetId = event.preparation.targetId;
-    let checkpointId = checkpoints.get(targetId);
+    const sanitizedTargetId = sanitizeForRef(targetId);
+    let checkpointId = checkpoints.get(sanitizedTargetId);
     let usingResumeCheckpoint = false;
 
     if (!checkpointId && resumeCheckpoint) {
@@ -315,11 +385,6 @@ export default function (pi: ExtensionAPI) {
     const beforeRestoreRef = await findBeforeRestoreRef(pi.exec);
     const hasUndo = !!beforeRestoreRef;
 
-    if (!checkpointId && !hasUndo) {
-      ctx.ui.notify("No checkpoint available for this message", "info");
-      return;
-    }
-
     const options: string[] = [];
 
     if (checkpointId) {
@@ -328,8 +393,10 @@ export default function (pi: ExtensionAPI) {
       } else {
         options.push("Restore files to that point");
       }
-      options.push("Keep current files");
     }
+
+    // Always offer "Keep current files" - user may want to navigate without restoring
+    options.push("Keep current files");
 
     if (hasUndo) {
       options.push("Undo last file rewind");
