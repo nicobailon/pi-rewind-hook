@@ -2,7 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
-## [1.5.0] - 2026-01-10
+## [1.6.0] - 2025-01-13
+
+### Added
+- `rewind.silentCheckpoints` setting to hide checkpoint status and notifications
+
+## [1.5.0] - 2025-01-10
 
 ### Changed
 - Replaced noisy stderr logging with clean TUI output

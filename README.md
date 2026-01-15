@@ -66,6 +66,23 @@ If you're upgrading from pi-rewind-hook v1.2.0 (which used the hooks system), si
 
 **Note:** v1.3.0+ requires pi v0.35.0 or later. If you're on an older version of pi, stay on pi-rewind-hook v1.2.0.
 
+## Configuration
+
+You can configure the extension by adding settings to `~/.pi/agent/settings.json`:
+
+```json
+{
+  "extensions": ["~/.pi/agent/extensions/rewind/index.ts"],
+  "rewind": {
+    "silentCheckpoints": true
+  }
+}
+```
+
+### Settings
+
+- **`rewind.silentCheckpoints`** (boolean, default: `false`): When set to `true`, disables checkpoint status messages. The footer checkpoint count (`◆ X checkpoints`) and checkpoint saved notifications (`Checkpoint X saved`) will not be displayed.
+
 ## How It Works
 
 ### Checkpoints

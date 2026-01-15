@@ -10,8 +10,9 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { exec as execCb } from "child_process";
+import { readFileSync } from "fs";
 import { mkdtemp, rm } from "fs/promises";
-import { tmpdir } from "os";
+import { homedir, tmpdir } from "os";
 import { join } from "path";
 import { promisify } from "util";
 
@@ -21,8 +22,26 @@ const REF_PREFIX = "refs/pi-checkpoints/";
 const BEFORE_RESTORE_PREFIX = "before-restore-";
 const MAX_CHECKPOINTS = 100;
 const STATUS_KEY = "rewind";
+const SETTINGS_FILE = join(homedir(), ".pi", "agent", "settings.json");
 
 type ExecFn = (cmd: string, args: string[]) => Promise<{ stdout: string; stderr: string; code: number }>;
+
+let cachedSilentCheckpoints: boolean | null = null;
+
+function getSilentCheckpointsSetting(): boolean {
+  if (cachedSilentCheckpoints !== null) {
+    return cachedSilentCheckpoints;
+  }
+  try {
+    const settingsContent = readFileSync(SETTINGS_FILE, "utf-8");
+    const settings = JSON.parse(settingsContent);
+    cachedSilentCheckpoints = settings.rewind?.silentCheckpoints === true;
+    return cachedSilentCheckpoints;
+  } catch {
+    cachedSilentCheckpoints = false;
+    return false;
+  }
+}
 
 /**
  * Sanitize entry ID for use in git ref names.
@@ -48,6 +67,10 @@ export default function (pi: ExtensionAPI) {
    */
   function updateStatus(ctx: ExtensionContext) {
     if (!ctx.hasUI) return;
+    if (getSilentCheckpointsSetting()) {
+      ctx.ui.setStatus(STATUS_KEY, undefined);
+      return;
+    }
     const theme = ctx.ui.theme;
     const count = checkpoints.size;
     ctx.ui.setStatus(STATUS_KEY, theme.fg("dim", "◆ ") + theme.fg("muted", `${count} checkpoint${count === 1 ? "" : "s"}`));
@@ -62,6 +85,7 @@ export default function (pi: ExtensionAPI) {
     repoRoot = null;
     isGitRepo = false;
     pendingCheckpoint = null;
+    cachedSilentCheckpoints = null;
   }
 
   /**
@@ -147,11 +171,8 @@ export default function (pi: ExtensionAPI) {
       await execAsync("git add -A", { cwd: root, env });
       const { stdout: treeSha } = await execAsync("git write-tree", { cwd: root, env });
 
-      const { stdout: commitSha } = await execAsync(
-        `git commit-tree ${treeSha.trim()} -m "rewind backup"`,
-        { cwd: root }
-      );
-      return commitSha.trim();
+      const result = await pi.exec("git", ["commit-tree", treeSha.trim(), "-m", "rewind backup"]);
+      return result.stdout.trim();
     } finally {
       await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     }
@@ -348,10 +369,11 @@ export default function (pi: ExtensionAPI) {
       ]);
 
       checkpoints.set(sanitizedEntryId, checkpointId);
-      const countBeforePrune = checkpoints.size;
       await pruneCheckpoints(pi.exec);
       updateStatus(ctx);
-      ctx.ui.notify(`Checkpoint ${countBeforePrune} saved`, "info");
+      if (!getSilentCheckpointsSetting()) {
+        ctx.ui.notify(`Checkpoint ${checkpoints.size} saved`, "info");
+      }
     } catch {
       // Silent failure - checkpoint creation is not critical
     } finally {
@@ -425,6 +447,11 @@ export default function (pi: ExtensionAPI) {
       if (success) {
         ctx.ui.notify("Files restored to before last rewind", "info");
       }
+      return { cancel: true };
+    }
+
+    if (!checkpointId) {
+      ctx.ui.notify("No checkpoint available", "error");
       return { cancel: true };
     }
 
@@ -515,6 +542,11 @@ export default function (pi: ExtensionAPI) {
       if (success) {
         ctx.ui.notify("Files restored to before last rewind", "info");
       }
+      return { cancel: true };
+    }
+
+    if (!checkpointId) {
+      ctx.ui.notify("No checkpoint available", "error");
       return { cancel: true };
     }
 
