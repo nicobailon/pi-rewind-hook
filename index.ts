@@ -2,7 +2,7 @@
  * Rewind Extension - Git-based file restoration for pi branching
  *
  * Creates worktree snapshots at the start of each agent loop (when user sends a message)
- * so /branch and tree navigation can restore code state.
+ * so /fork and /tree navigation can restore code state.
  * Supports: restore files + conversation, files only, conversation only, undo last restore.
  *
  * Updated for pi-coding-agent v0.35.0+ (unified extensions system)

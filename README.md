@@ -96,9 +96,9 @@ Checkpoints are stored as git refs under `refs/pi-checkpoints/` and are scoped p
 
 ### Rewinding
 
-To rewind via `/branch`:
+To rewind via `/fork`:
 
-1. Type `/branch` in pi
+1. Type `/fork` in pi
 2. Select a message to branch from
 3. Choose a restore option
 
@@ -138,7 +138,7 @@ When you resume a session (`pi --resume`), the extension creates a resume checkp
 You: refactor the auth module to use JWT
 Agent: [makes changes you don't like]
 
-You: /branch
+You: /fork
 → Select "refactor the auth module to use JWT"
 → Select "Code only (restore files, keep conversation)"
 
@@ -148,7 +148,7 @@ Result: Files restored, conversation intact. Try a different approach.
 ### Start fresh from a checkpoint
 
 ```
-You: /branch
+You: /fork
 → Select an earlier message
 → Select "Restore all (files + conversation)"
 
@@ -164,7 +164,7 @@ pi --resume  # resume old session
 ```
 Agent: [immediately breaks something]
 
-You: /branch
+You: /fork
 → Select any old message
 → Select "Restore to session start (files only, keep conversation)"
 
