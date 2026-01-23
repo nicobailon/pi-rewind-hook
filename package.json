@@ -1,6 +1,6 @@
 {
   "name": "pi-rewind-hook",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Rewind extension for Pi agent - automatic git checkpoints with file/conversation restore",
   "bin": {
     "pi-rewind-hook": "./install.js"

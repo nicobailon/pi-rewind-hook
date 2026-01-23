@@ -331,8 +331,8 @@ export default function (pi: ExtensionAPI) {
     // Only loads checkpoints belonging to this session
     await rebuildCheckpointsMap(pi.exec, sessionId);
 
-    // Create a resume checkpoint for the current state
-    const checkpointId = `checkpoint-resume-${Date.now()}`;
+    // Create a resume checkpoint for the current state (session-scoped like other checkpoints)
+    const checkpointId = `checkpoint-resume-${sessionId}-${Date.now()}`;
 
     try {
       const success = await createCheckpointFromWorktree(pi.exec, checkpointId);
@@ -438,19 +438,17 @@ export default function (pi: ExtensionAPI) {
 
     const options: string[] = [];
 
+    // Conversation-only (non-file-restorative) first as most common action
+    options.push("Conversation only (keep current files)");
+    
     if (checkpointId) {
       if (usingResumeCheckpoint) {
         options.push("Restore to session start (files + conversation)");
-        options.push("Conversation only (keep current files)");
         options.push("Restore to session start (files only, keep conversation)");
       } else {
         options.push("Restore all (files + conversation)");
-        options.push("Conversation only (keep current files)");
         options.push("Code only (restore files, keep conversation)");
       }
-    } else {
-      // No checkpoint available - still allow conversation-only branch
-      options.push("Conversation only (keep current files)");
     }
 
     if (hasUndo) {
@@ -541,6 +539,9 @@ export default function (pi: ExtensionAPI) {
 
     const options: string[] = [];
 
+    // Keep current files first as most common action (non-file-restorative navigation)
+    options.push("Keep current files");
+
     if (checkpointId) {
       if (usingResumeCheckpoint) {
         options.push("Restore files to session start");
@@ -548,9 +549,6 @@ export default function (pi: ExtensionAPI) {
         options.push("Restore files to that point");
       }
     }
-
-    // Always offer "Keep current files" - user may want to navigate without restoring
-    options.push("Keep current files");
 
     if (hasUndo) {
       options.push("Undo last file rewind");

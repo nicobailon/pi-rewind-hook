@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.1] - 2026-01-22
+
+### Changed
+- Reordered restore menus to show non-file-restorative options first (most common action)
+  - Branch menu: "Conversation only" now appears first
+  - Tree navigation: "Keep current files" now appears first
+
+### Fixed
+- Resume checkpoint now session-scoped (`checkpoint-resume-{sessionId}-{timestamp}`) for consistency with other checkpoint types
+
 ## [1.7.0] - 2026-01-15
 
 ### Fixed
