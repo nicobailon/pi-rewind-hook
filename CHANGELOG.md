@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.7.3] - 2026-01-26
+
+### Fixed
+- Install script now uses auto-discovery instead of adding to `settings.extensions`
+- Install script now downloads `package.json` with `pi.extensions` declaration
+- Removes rewind from explicit extensions array if present (prevents duplicate loading errors)
+
 ## [1.7.2] - 2026-01-26
 
 ### Changed
