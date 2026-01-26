@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.7.2] - 2026-01-26
+
 ### Changed
 - Added `pi-package` keyword for npm discoverability (pi v0.50.0 package system)
 
