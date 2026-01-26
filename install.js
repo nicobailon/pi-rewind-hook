@@ -9,7 +9,6 @@ const REPO_URL = "https://raw.githubusercontent.com/nicobailon/pi-rewind-hook/ma
 const EXT_DIR = path.join(os.homedir(), ".pi", "agent", "extensions", "rewind");
 const OLD_HOOK_DIR = path.join(os.homedir(), ".pi", "agent", "hooks", "rewind");
 const SETTINGS_FILE = path.join(os.homedir(), ".pi", "agent", "settings.json");
-const EXT_PATH = "~/.pi/agent/extensions/rewind/index.ts";
 
 function download(url) {
   return new Promise((resolve, reject) => {
@@ -38,62 +37,53 @@ async function main() {
   const extContent = await download(`${REPO_URL}/index.ts`);
   fs.writeFileSync(path.join(EXT_DIR, "index.ts"), extContent);
 
+  console.log("Downloading package.json...");
+  const pkgContent = await download(`${REPO_URL}/package.json`);
+  fs.writeFileSync(path.join(EXT_DIR, "package.json"), pkgContent);
+
   console.log("Downloading README.md...");
   const readmeContent = await download(`${REPO_URL}/README.md`);
   fs.writeFileSync(path.join(EXT_DIR, "README.md"), readmeContent);
 
-  console.log(`\nUpdating settings: ${SETTINGS_FILE}`);
-  
-  let settings = {};
+  // Migrate old hooks to extensions and clean up legacy settings
   if (fs.existsSync(SETTINGS_FILE)) {
     try {
-      settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf-8"));
+      let settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf-8"));
+      let modified = false;
+
+      // Remove old hooks key
+      if (settings.hooks && Array.isArray(settings.hooks)) {
+        delete settings.hooks;
+        console.log("\nRemoved old 'hooks' key from settings");
+        modified = true;
+      }
+
+      // Remove rewind from explicit extensions (auto-discovery handles it now)
+      if (Array.isArray(settings.extensions)) {
+        const before = settings.extensions.length;
+        settings.extensions = settings.extensions.filter(p => 
+          !p.includes("/extensions/rewind")
+        );
+        if (settings.extensions.length < before) {
+          console.log("Removed rewind from explicit extensions (auto-discovery handles it)");
+          modified = true;
+        }
+        // Clean up empty extensions array
+        if (settings.extensions.length === 0) {
+          delete settings.extensions;
+          modified = true;
+        }
+      }
+
+      if (modified) {
+        fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2) + "\n");
+      }
     } catch (err) {
-      console.error(`Warning: Could not parse existing settings.json: ${err.message}`);
-      console.error("Creating new settings file...");
+      console.error(`Warning: Could not update settings.json: ${err.message}`);
     }
   }
 
-  if (settings.hooks && Array.isArray(settings.hooks) && settings.hooks.length > 0) {
-    console.log("\nMigrating hooks to extensions...");
-    if (!Array.isArray(settings.extensions)) {
-      settings.extensions = [];
-    }
-    for (const entry of settings.hooks) {
-      if (entry.includes("/hooks/rewind")) {
-        continue;
-      }
-      const newPath = entry.replace("/hooks/", "/extensions/");
-      if (!settings.extensions.includes(newPath)) {
-        settings.extensions.push(newPath);
-        console.log(`  Migrated: ${entry} -> ${newPath}`);
-      }
-    }
-    delete settings.hooks;
-    console.log("Removed old 'hooks' key from settings");
-  }
-
-  if (!Array.isArray(settings.extensions)) {
-    settings.extensions = [];
-  }
-
-  const EXT_PATH_ALT = "~/.pi/agent/extensions/rewind";
-  const hasRewindExt = settings.extensions.some(p => 
-    p === EXT_PATH || p === EXT_PATH_ALT || 
-    p.includes("/extensions/rewind/index.ts") || 
-    p.endsWith("/extensions/rewind")
-  );
-
-  if (!hasRewindExt) {
-    settings.extensions.push(EXT_PATH);
-    console.log(`Added "${EXT_PATH}" to extensions array`);
-  } else {
-    console.log("Extension already configured in settings.json");
-  }
-
-  fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true });
-  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2) + "\n");
-
+  // Clean up old hooks directory
   if (fs.existsSync(OLD_HOOK_DIR)) {
     console.log(`\nCleaning up old hooks directory: ${OLD_HOOK_DIR}`);
     fs.rmSync(OLD_HOOK_DIR, { recursive: true, force: true });
@@ -101,8 +91,8 @@ async function main() {
   }
 
   console.log("\nInstallation complete!");
-  console.log("\nThe rewind extension will load automatically when you start pi.");
-  console.log("Use /branch to rewind to a previous checkpoint.");
+  console.log("\nThe extension is auto-discovered from ~/.pi/agent/extensions/rewind/");
+  console.log("Restart pi to load the extension. Use /branch to rewind to a checkpoint.");
 }
 
 main().catch((err) => {
