@@ -17,7 +17,7 @@ A Pi agent extension that enables rewinding file changes during coding sessions.
 ## Installation
 
 ```bash
-npx pi-rewind-hook
+pi install npm:pi-rewind-hook
 ```
 
 This will:
