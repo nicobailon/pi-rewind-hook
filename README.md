@@ -1,3 +1,5 @@
+![pi-rewind](banner.png)
+
 # Rewind Extension
 
 A Pi agent extension that enables rewinding file changes during coding sessions. Creates automatic checkpoints using git refs, allowing you to restore files to previous states while optionally preserving conversation history.
