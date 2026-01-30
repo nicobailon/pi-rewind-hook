@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-01-29
+
+### Added
+- **Prompt-to-code attribution** — tracks which user prompts caused which code changes
+  - Per-turn trace capture at `agent_end` with before/after worktree snapshots
+  - Per-line attribution resolved at commit time using forward diff composition
+  - Git notes (`refs/notes/pi-trace`) store finalized traces and resolved line ranges on each commit
+  - Dedicated trace SHA refs (`refs/pi-trace-shas/`) prevent garbage collection of worktree snapshots
+  - JSONL storage (`.pi-trace/traces.jsonl`) for in-session trace data, auto-capped at 100 entries
+- **`/trace` command** — interactive turn browser and per-line blame
+  - `/trace` opens a turn browser showing prompts, file counts, and line deltas; drill into any turn to view per-file diffs
+  - `/trace blame <file> [startLine-endLine]` shows per-line prompt attribution with auto-detection of committed vs uncommitted files
+  - Tab completion for subcommands and file paths
+- **Commit detection** — `tool_result` handler detects `git commit` commands and persists trace data to git notes with full per-line resolution
+- **Post-commit hook** (opt-in via `rewind.traceHook: true`) — standalone JS hook writes raw traces to git notes for commits made outside pi's agent loop (e.g., manual `git commit` in another terminal while pi is running, or after pi exits while trace data still exists)
+- **`trace-cli.js`** — standalone CLI for querying trace data outside pi
+  - `blame [-L start,end] <file>` — per-line prompt attribution
+  - `log` — list session traces
+  - `show <trace-id>` — show trace details with diff
+- **Enriched `/branch` UI** — `session_before_fork` now shows file count and line deltas from trace data
+
+### Changed
+- Extension split into multi-file structure: `index.ts`, `trace.ts`, `diff.ts`, `blame.ts`, `persist.ts`, plus standalone JS scripts `post-commit-hook.js` and `trace-cli.js`
+- Trace records follow the [Agent Trace](https://github.com/cursor/agent-trace) schema for interoperability
+
+### Configuration
+- **`rewind.traceHook`** (boolean, default: `false`): Install a git post-commit hook that writes trace data to git notes for commits made outside pi's agent loop
+
 ## [1.7.3] - 2026-01-26
 
 ### Fixed

@@ -10,11 +10,22 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { exec as execCb } from "child_process";
-import { readFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, chmodSync, mkdirSync } from "fs";
 import { mkdtemp, rm } from "fs/promises";
 import { homedir, tmpdir } from "os";
 import { join } from "path";
 import { promisify } from "util";
+import {
+  ensureTraceDir,
+  readTraces,
+  appendTrace,
+  collectTraceShas,
+  cleanOrphanedTraceRefs,
+  type TraceRecord,
+} from "./trace";
+import { createDiffEngine } from "./diff";
+import { looksLikeGitCommit, handleCommitDetected } from "./persist";
+import { blameCommitted, blameUncommitted, type BlameResult } from "./blame";
 
 const execAsync = promisify(execCb);
 
@@ -27,6 +38,7 @@ const SETTINGS_FILE = join(homedir(), ".pi", "agent", "settings.json");
 type ExecFn = (cmd: string, args: string[]) => Promise<{ stdout: string; stderr: string; code: number }>;
 
 let cachedSilentCheckpoints: boolean | null = null;
+let cachedTraceHook: boolean | null = null;
 
 function getSilentCheckpointsSetting(): boolean {
   if (cachedSilentCheckpoints !== null) {
@@ -39,6 +51,21 @@ function getSilentCheckpointsSetting(): boolean {
     return cachedSilentCheckpoints;
   } catch {
     cachedSilentCheckpoints = false;
+    return false;
+  }
+}
+
+function getTraceHookSetting(): boolean {
+  if (cachedTraceHook !== null) {
+    return cachedTraceHook;
+  }
+  try {
+    const settingsContent = readFileSync(SETTINGS_FILE, "utf-8");
+    const settings = JSON.parse(settingsContent);
+    cachedTraceHook = settings.rewind?.traceHook === true;
+    return cachedTraceHook;
+  } catch {
+    cachedTraceHook = false;
     return false;
   }
 }
@@ -62,6 +89,11 @@ export default function (pi: ExtensionAPI) {
   // Pending checkpoint: worktree state captured at turn_start, waiting for turn_end
   // to associate with the correct user message entry ID
   let pendingCheckpoint: { commitSha: string; timestamp: number } | null = null;
+
+  // Trace state
+  let traceBeforeSha: string | null = null;
+  let cachedModel: string | null = null;
+  const diffCache = new Map<string, Map<string, import("./diff").DiffHunk[]>>();
   
   /**
    * Update the footer status with checkpoint count
@@ -88,6 +120,10 @@ export default function (pi: ExtensionAPI) {
     sessionId = null;
     pendingCheckpoint = null;
     cachedSilentCheckpoints = null;
+    cachedTraceHook = null;
+    traceBeforeSha = null;
+    cachedModel = null;
+    diffCache.clear();
   }
 
   /**
@@ -303,9 +339,25 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  /**
-   * Initialize the extension for the current session/repo
-   */
+  function installPostCommitHook(root: string): void {
+    const hookDir = join(root, ".git", "hooks");
+    if (!existsSync(hookDir)) mkdirSync(hookDir, { recursive: true });
+    const hookPath = join(hookDir, "post-commit");
+    const hookScript = new URL("./post-commit-hook.js", import.meta.url).pathname;
+    const callLine = `node "${hookScript}"`;
+
+    if (!existsSync(hookPath)) {
+      writeFileSync(hookPath, `#!/bin/sh\n${callLine}\n`, "utf-8");
+      chmodSync(hookPath, 0o755);
+    } else {
+      const content = readFileSync(hookPath, "utf-8");
+      if (!content.includes("post-commit-hook.js")) {
+        writeFileSync(hookPath, content.trimEnd() + `\n${callLine}\n`, "utf-8");
+        chmodSync(hookPath, 0o755);
+      }
+    }
+  }
+
   async function initializeForSession(ctx: ExtensionContext) {
     if (!ctx.hasUI) return;
 
@@ -325,6 +377,20 @@ export default function (pi: ExtensionAPI) {
     if (!isGitRepo) {
       ctx.ui.setStatus(STATUS_KEY, undefined);
       return;
+    }
+
+    // Initialize trace directory and clean orphaned refs
+    try {
+      const root = await getRepoRoot(pi.exec);
+      ensureTraceDir(root);
+      const traces = readTraces(root);
+      await cleanOrphanedTraceRefs(pi.exec, collectTraceShas(traces));
+
+      if (getTraceHookSetting()) {
+        installPostCommitHook(root);
+      }
+    } catch {
+      // Silent failure - trace init is not critical
     }
 
     // Rebuild checkpoints map from existing git refs (for resumed sessions)
@@ -369,6 +435,7 @@ export default function (pi: ExtensionAPI) {
       // so we don't know its entry ID. We'll create the ref at turn_end.
       const commitSha = await captureWorktree();
       pendingCheckpoint = { commitSha, timestamp: event.timestamp };
+      traceBeforeSha = commitSha;
     } catch {
       pendingCheckpoint = null;
     }
@@ -413,6 +480,173 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  pi.on("model_select", (event) => {
+    cachedModel = `${event.model.provider}/${event.model.id}`;
+  });
+
+  pi.on("agent_end", async (event, ctx) => {
+    if (!ctx.hasUI) return;
+    if (!isGitRepo) return;
+    if (!traceBeforeSha) return;
+
+    try {
+      const afterCommitSha = await captureWorktree();
+      const root = await getRepoRoot(pi.exec);
+
+      const diffResult = await pi.exec("git", [
+        "diff-tree", "--numstat", "-r", "-z", traceBeforeSha, afterCommitSha,
+      ]);
+      const rawEntries = diffResult.stdout.split("\0").filter(Boolean);
+      if (rawEntries.length === 0) return;
+
+      const files: import("./trace").TraceRecord["files"] = [];
+      const additions: Record<string, number> = {};
+      const deletions: Record<string, number> = {};
+
+      for (const entry of rawEntries) {
+        const parts = entry.split("\t");
+        if (parts.length < 3) continue;
+        const [added, deleted, filePath] = parts;
+        files.push({
+          path: filePath,
+          conversations: [{
+            contributor: {
+              type: "ai" as const,
+              ...(cachedModel ? { model_id: cachedModel } : {}),
+            },
+            ranges: [],
+          }],
+        });
+        if (added !== "-") additions[filePath] = parseInt(added, 10);
+        if (deleted !== "-") deletions[filePath] = parseInt(deleted, 10);
+      }
+
+      if (files.length === 0) return;
+
+      let headSha = "";
+      try {
+        const headResult = await pi.exec("git", ["rev-parse", "HEAD"]);
+        headSha = headResult.stdout.trim();
+      } catch { /* empty repo */ }
+
+      let userMessage = "";
+      let assistantMessage = "";
+      try {
+        if (event.messages) {
+          for (const msg of event.messages) {
+            if ("role" in msg && msg.role === "user" && "content" in msg && !userMessage) {
+              const content = msg.content;
+              if (typeof content === "string") {
+                userMessage = content;
+              } else if (Array.isArray(content)) {
+                const textParts = content.filter((c: any) => c.type === "text").map((c: any) => c.text);
+                userMessage = textParts.join("\n");
+              }
+            }
+            if ("role" in msg && msg.role === "assistant" && "content" in msg && !assistantMessage) {
+              const content = msg.content;
+              if (typeof content === "string") {
+                assistantMessage = content;
+              } else if (Array.isArray(content)) {
+                const textParts = content.filter((c: any) => c.type === "text").map((c: any) => c.text);
+                assistantMessage = textParts.join("\n");
+              }
+            }
+          }
+        }
+      } catch { /* transcript capture is best-effort */ }
+
+      const pkgVersion = (() => {
+        try {
+          const pkgPath = new URL("./package.json", import.meta.url);
+          const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+          return pkg.version || "0.0.0";
+        } catch {
+          return "0.0.0";
+        }
+      })();
+
+      const userEntry = findUserMessageEntry(ctx.sessionManager);
+      const record: TraceRecord = {
+        version: "1.0",
+        id: crypto.randomUUID(),
+        timestamp: new Date().toISOString(),
+        ...(headSha ? { vcs: { type: "git", revision: headSha } } : {}),
+        tool: { name: "pi-rewind-hook", version: pkgVersion },
+        files,
+        metadata: {
+          "pi.session_id": sessionId || "",
+          "pi.entry_id": userEntry?.id || "",
+          "pi.before_sha": traceBeforeSha,
+          "pi.after_sha": afterCommitSha,
+          "pi.user_message": userMessage,
+          ...(assistantMessage ? { "pi.assistant_message": assistantMessage } : {}),
+          "pi.additions": additions,
+          "pi.deletions": deletions,
+        },
+      };
+
+      appendTrace(root, record);
+
+      await pi.exec("git", [
+        "update-ref", `refs/pi-trace-shas/${traceBeforeSha}`, traceBeforeSha,
+      ]);
+      await pi.exec("git", [
+        "update-ref", `refs/pi-trace-shas/${afterCommitSha}`, afterCommitSha,
+      ]);
+    } catch {
+      // Silent failure - trace capture is not critical
+    } finally {
+      traceBeforeSha = null;
+    }
+  });
+
+  pi.on("tool_result", async (event, ctx) => {
+    if (!ctx.hasUI) return;
+    if (!isGitRepo) return;
+    if (!("input" in event) || !event.input) return;
+    const input = event.input as Record<string, unknown>;
+    if (typeof input.command !== "string") return;
+    if (!looksLikeGitCommit(input.command)) return;
+    if ("isError" in event && event.isError) return;
+
+    try {
+      const root = await getRepoRoot(pi.exec);
+
+      let userMessage = "";
+      try {
+        const entry = findUserMessageEntry(ctx.sessionManager);
+        if (entry) {
+          const leafId = ctx.sessionManager.getLeafId();
+          if (leafId) {
+            const branch = ctx.sessionManager.getBranch(leafId);
+            const userEntry = branch.find((e: any) => e.id === entry.id);
+            if (userEntry?.message?.content) {
+              const c = userEntry.message.content;
+              userMessage = typeof c === "string" ? c :
+                Array.isArray(c) ? c.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n") : "";
+            }
+          }
+        }
+      } catch { /* best-effort */ }
+
+      const result = await handleCommitDetected({
+        exec: pi.exec,
+        repoRoot: root,
+        traceBeforeSha,
+        captureWorktree,
+        diffCache,
+        sessionId: sessionId || "",
+        cachedModel,
+        findUserMessageEntry: () => findUserMessageEntry(ctx.sessionManager),
+        userMessage,
+      });
+      traceBeforeSha = result.newTraceBeforeSha;
+    } catch {
+      // Silent failure - commit persistence is not critical
+    }
+  });
+
   pi.on("session_before_fork", async (event, ctx) => {
     if (!ctx.hasUI) return;
     if (!sessionId) return;
@@ -432,6 +666,26 @@ export default function (pi: ExtensionAPI) {
       checkpointId = resumeCheckpoint;
       usingResumeCheckpoint = true;
     }
+
+    try {
+      const root = await getRepoRoot(pi.exec);
+      const traces = readTraces(root);
+      const matchingTrace = traces.find(
+        t => t.metadata?.["pi.entry_id"] === event.entryId ||
+             t.metadata?.["pi.entry_id"] === sanitizedEntryId
+      );
+      if (matchingTrace) {
+        const adds = matchingTrace.metadata?.["pi.additions"] as Record<string, number> | undefined;
+        const dels = matchingTrace.metadata?.["pi.deletions"] as Record<string, number> | undefined;
+        const fileCount = matchingTrace.files.length;
+        const totalAdds = adds ? Object.values(adds).reduce((s, v) => s + v, 0) : 0;
+        const totalDels = dels ? Object.values(dels).reduce((s, v) => s + v, 0) : 0;
+        ctx.ui.notify(
+          `This message changed ${fileCount} file${fileCount === 1 ? "" : "s"} (+${totalAdds}, -${totalDels} lines)`,
+          "info"
+        );
+      }
+    } catch { /* trace context is best-effort */ }
 
     const beforeRestoreRef = await findBeforeRestoreRef(pi.exec, sessionId);
     const hasUndo = !!beforeRestoreRef;
@@ -606,5 +860,234 @@ export default function (pi: ExtensionAPI) {
       "info"
     );
   });
+
+  // /trace command registration
+  let cachedTraceFiles: string[] = [];
+
+  pi.registerCommand("trace", {
+    description: "View prompt-to-code attribution. Usage: /trace or /trace blame <file> [startLine-endLine]",
+    getArgumentCompletions(prefix: string) {
+      if (!prefix || !prefix.trim()) {
+        return [{ value: "blame", label: "blame — show per-line prompt attribution" }];
+      }
+      const trimmed = prefix.trim();
+      if ("blame".startsWith(trimmed) && trimmed !== "blame") {
+        return [{ value: "blame", label: "blame — show per-line prompt attribution" }];
+      }
+      if (trimmed.startsWith("blame ")) {
+        const filePrefix = trimmed.slice(6).trim();
+        return cachedTraceFiles
+          .filter(f => f.startsWith(filePrefix))
+          .map(f => ({ value: `blame ${f}`, label: f }));
+      }
+      return null;
+    },
+    async handler(args: string, ctx: ExtensionContext) {
+      if (!isGitRepo) {
+        ctx.ui.notify("Not in a git repository", "error");
+        return;
+      }
+
+      try {
+        const root = await getRepoRoot(pi.exec);
+        const traces = readTraces(root);
+        cachedTraceFiles = [...new Set(traces.flatMap(t => t.files.map(f => f.path)))];
+
+        const trimmedArgs = (args || "").trim();
+
+        if (trimmedArgs.startsWith("blame")) {
+          await handleBlameCommand(trimmedArgs.slice(5).trim(), ctx, root);
+        } else {
+          await handleTurnBrowser(ctx, traces);
+        }
+      } catch (err) {
+        ctx.ui.notify(`Trace error: ${err}`, "error");
+      }
+    },
+  });
+
+  async function handleBlameCommand(
+    blameArgs: string,
+    ctx: ExtensionContext,
+    root: string,
+  ) {
+    if (!blameArgs) {
+      ctx.ui.notify("Usage: /trace blame <file> [startLine-endLine]", "error");
+      return;
+    }
+
+    let filePath: string;
+    let startLine: number | undefined;
+    let endLine: number | undefined;
+
+    const rangeMatch = blameArgs.match(/^(.+?)\s+(\d+)(?:-(\d+))?$/);
+    if (rangeMatch) {
+      filePath = rangeMatch[1];
+      startLine = parseInt(rangeMatch[2], 10);
+      endLine = rangeMatch[3] ? parseInt(rangeMatch[3], 10) : startLine;
+    } else {
+      filePath = blameArgs;
+    }
+
+    const statusResult = await pi.exec("git", ["status", "--porcelain", "--", filePath]);
+    const isDirty = statusResult.stdout.trim().length > 0;
+
+    const computeLineDiff = createDiffEngine(pi.exec, diffCache);
+
+    let results: BlameResult[];
+
+    if (isDirty) {
+      results = await blameUncommitted(
+        filePath,
+        () => readTraces(root),
+        computeLineDiff,
+        captureWorktree,
+        startLine,
+        endLine,
+      );
+    } else {
+      results = await blameCommitted(pi.exec, filePath, startLine, endLine);
+    }
+
+    if (results.length === 0) {
+      ctx.ui.notify("No blame results", "warning");
+      return;
+    }
+
+    const rangeLabel = startLine
+      ? endLine && endLine !== startLine ? `${startLine}-${endLine}` : `${startLine}`
+      : "all";
+    const header = `${filePath}:${rangeLabel} -- prompt attribution${isDirty ? " (uncommitted)" : ""}`;
+
+    const lines: string[] = [header, "─".repeat(60)];
+
+    if (isDirty) {
+      lines.push("File has uncommitted changes -- showing current session only.");
+      lines.push("Commit for full history.");
+      lines.push("");
+    }
+
+    let i = 0;
+    while (i < results.length) {
+      const entry = results[i];
+      const attr = entry.attribution;
+      let label: string;
+      let detail = "";
+
+      if (typeof attr === "string") {
+        label = `(${attr})`;
+      } else {
+        const msg = attr.userMessage.length > 55
+          ? attr.userMessage.slice(0, 55) + "..."
+          : attr.userMessage;
+        const ref = attr.commitSha ? attr.commitSha.slice(0, 7) : attr.traceId.slice(0, 8);
+        label = `${ref}  "${msg}"`;
+        if (attr.modelId || attr.timestamp) {
+          const parts: string[] = [];
+          if (attr.modelId) parts.push(attr.modelId);
+          const ts = new Date(attr.timestamp);
+          if (!isNaN(ts.getTime())) {
+            parts.push(ts.toLocaleDateString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }));
+          }
+          detail = parts.join("  ");
+        }
+      }
+
+      let rangeEnd = i;
+      while (
+        rangeEnd + 1 < results.length &&
+        JSON.stringify(results[rangeEnd + 1].attribution) === JSON.stringify(entry.attribution)
+      ) {
+        rangeEnd++;
+      }
+
+      const startLn = results[i].lineNumber;
+      const endLn = results[rangeEnd].lineNumber;
+      const lineRange = startLn === endLn ? ` ${startLn}` : ` ${startLn}-${endLn}`;
+      lines.push(`${lineRange.padEnd(10)} ${label}`);
+      if (detail) {
+        lines.push(`${"".padEnd(10)} ${detail}`);
+      }
+
+      i = rangeEnd + 1;
+    }
+
+    lines.push("─".repeat(60));
+    lines.push(" q to close");
+
+    const output = lines.join("\n");
+
+    await new Promise<void>((done) => {
+      ctx.ui.custom((_tui, _theme, keybindings, resolve) => {
+        keybindings.add({ key: "q", handler: () => { resolve(); done(); } });
+        keybindings.add({ key: "escape", handler: () => { resolve(); done(); } });
+        return output;
+      });
+    });
+  }
+
+  async function handleTurnBrowser(
+    ctx: ExtensionContext,
+    traces: import("./trace").TraceRecord[],
+  ) {
+    if (traces.length === 0) {
+      ctx.ui.notify("No trace data -- no prompts have been tracked yet", "warning");
+      return;
+    }
+
+    const items = traces.map((t, i) => {
+      const msg = (t.metadata?.["pi.user_message"] as string || "").slice(0, 60);
+      const fileCount = t.files.length;
+      const adds = t.metadata?.["pi.additions"] as Record<string, number> | undefined;
+      const dels = t.metadata?.["pi.deletions"] as Record<string, number> | undefined;
+      const totalAdds = adds ? Object.values(adds).reduce((s, v) => s + v, 0) : 0;
+      const totalDels = dels ? Object.values(dels).reduce((s, v) => s + v, 0) : 0;
+      return `${i + 1}. "${msg}" — ${fileCount} file${fileCount === 1 ? "" : "s"} (+${totalAdds}, -${totalDels})`;
+    }).reverse();
+
+    const choice = await ctx.ui.select("Recent Traces", items);
+    if (!choice) return;
+
+    const idx = parseInt(choice.split(".")[0], 10) - 1;
+    if (idx < 0 || idx >= traces.length) return;
+
+    const trace = traces[idx];
+    const fileItems = trace.files.map(f => {
+      const adds = (trace.metadata?.["pi.additions"] as Record<string, number>)?.[f.path] ?? 0;
+      const dels = (trace.metadata?.["pi.deletions"] as Record<string, number>)?.[f.path] ?? 0;
+      return `${f.path} (+${adds}, -${dels})`;
+    });
+
+    const fileChoice = await ctx.ui.select("Files Changed", fileItems);
+    if (!fileChoice) return;
+
+    const selectedPath = fileChoice.split(" (+")[0];
+    const beforeSha = trace.metadata?.["pi.before_sha"] as string;
+    const afterSha = trace.metadata?.["pi.after_sha"] as string;
+    if (!beforeSha || !afterSha) return;
+
+    const computeLineDiff = createDiffEngine(pi.exec, diffCache);
+    const hunks = await computeLineDiff(beforeSha, afterSha, selectedPath);
+
+    const diffLines: string[] = [`--- ${selectedPath}`, `+++ ${selectedPath}`, ""];
+    for (const hunk of hunks) {
+      for (const line of hunk.lines) {
+        if (hunk.type === "add") diffLines.push(`+${line}`);
+        else if (hunk.type === "delete") diffLines.push(`-${line}`);
+        else diffLines.push(` ${line}`);
+      }
+    }
+
+    diffLines.push("", " q to close");
+    const output = diffLines.join("\n");
+
+    await new Promise<void>((done) => {
+      ctx.ui.custom((_tui, _theme, keybindings, resolve) => {
+        keybindings.add({ key: "q", handler: () => { resolve(); done(); } });
+        keybindings.add({ key: "escape", handler: () => { resolve(); done(); } });
+        return output;
+      });
+    });
+  }
 
 }
