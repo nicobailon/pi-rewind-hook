@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-04-03
+
 ### Changed
 - Replaced the old git-ref checkpoint ledger with session-native `rewind-turn` and `rewind-op` records
 - Rewind points are now aligned to visible session nodes: the triggering user node and each assistant step captured at `turn_end`
