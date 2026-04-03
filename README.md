@@ -1,8 +1,8 @@
-![pi-rewind](banner.png)
-
 # Rewind Extension
 
-A Pi agent extension that enables rewinding file changes during coding sessions. Creates automatic checkpoints using git refs, allowing you to restore files to previous states while optionally preserving conversation history.
+A Pi agent extension that records exact file-state rewind points, allowing restoration of file states during `/tree` navigation and across resumed and forked sessions
+
+Rewind metadata lives in the session itself as hidden entries, so rewind history survives across forks, resumes, tree navigation, and compaction. Snapshot commits are kept reachable through a single git ref rather than one ref per checkpoint, and rewind points can be resolved across session lineage via `parentSession` links. Retention is optional and configurable; without it, exact history is kept indefinitely.
 
 ## Screenshots
 
@@ -12,129 +12,93 @@ A Pi agent extension that enables rewinding file changes during coding sessions.
 
 ## Requirements
 
-- Pi agent v0.35.0+ (unified extensions system)
+- Pi agent v0.35.0+
 - Node.js (for installation)
-- Git repository (checkpoints are stored as git refs)
+- Git repository
 
 ## Installation
 
 ```bash
-pi install npm:pi-rewind-hook
+npx pi-rewind-hook
 ```
 
 This will:
 1. Create `~/.pi/agent/extensions/rewind/`
 2. Download the extension files
 3. Add the extension to your `~/.pi/agent/settings.json`
-4. Migrate any existing hooks config to extensions (if upgrading from v1.2.0)
+4. Migrate any existing hooks config to extensions (if upgrading from an older version)
 5. Clean up old `hooks/rewind` directory (if present)
 
-### Alternative Installation
-
-Using curl:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/nicobailon/pi-rewind-hook/main/install.js | node
-```
-
-Or clone the repo and configure manually:
-
-```bash
-git clone https://github.com/nicobailon/pi-rewind-hook ~/.pi/agent/extensions/rewind
-```
-
-Then add to `~/.pi/agent/settings.json`:
-
-```json
-{
-  "extensions": ["~/.pi/agent/extensions/rewind/index.ts"]
-}
-```
-
-### Platform Notes
-
-**Windows:** The `npx` command works in PowerShell, Command Prompt, and WSL. If you prefer curl on Windows without WSL:
-
-```powershell
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/nicobailon/pi-rewind-hook/main/install.js" -OutFile install.js; node install.js; Remove-Item install.js
-```
-
-### Upgrading from v1.2.0
-
-If you're upgrading from pi-rewind-hook v1.2.0 (which used the hooks system), simply run `npx pi-rewind-hook` again. The installer will:
-- Move the extension from `hooks/rewind` to `extensions/rewind`
-- Migrate your settings.json from `hooks` to `extensions`
-- Clean up the old hooks directory
-
-**Note:** v1.3.0+ requires pi v0.35.0 or later. If you're on an older version of pi, stay on pi-rewind-hook v1.2.0.
+Or clone the repo into `~/.pi/agent/extensions/rewind/` — Pi discovers extensions in that directory automatically.
 
 ## Configuration
 
-You can configure the extension by adding settings to `~/.pi/agent/settings.json`:
+Optionally add settings to `~/.pi/agent/settings.json`.  For example:
 
 ```json
 {
-  "extensions": ["~/.pi/agent/extensions/rewind/index.ts"],
   "rewind": {
-    "silentCheckpoints": true
+    "silentCheckpoints": true,
+    "retention": {
+      "maxSnapshots": 2000,
+      "maxAgeDays": 30,
+      "pinLabeledEntries": true
+    }
   }
 }
 ```
 
 ### Settings
 
-- **`rewind.silentCheckpoints`** (boolean, default: `false`): When set to `true`, disables checkpoint status messages. The footer checkpoint count (`◆ X checkpoints`) and checkpoint saved notifications (`Checkpoint X saved`) will not be displayed.
+- `rewind.silentCheckpoints` — hides footer/status and checkpoint notifications
+- `rewind.retention.maxSnapshots` — optional cap on unpinned unique snapshot commits kept reachable
+- `rewind.retention.maxAgeDays` — optional age limit for unpinned snapshot commits
+- `rewind.retention.pinLabeledEntries` — when true, snapshot commits bound to **labeled nodes** in the Pi session tree are exempt from `maxSnapshots` and `maxAgeDays` pruning (useful for bookmarking important rewind points you want to prevent getting garbage-collected)
+- `rewind.retention.scanMode` — retention discovery mode: `ancestor-only` (default, follow current session lineage only) or `repo-sessions` (scan discovered session roots)
+- `rewind.retention.startupBudgetMs` — optional startup time budget for retention sweeps; if exceeded, startup sweep is skipped and deferred
 
-## How It Works
+If `rewind.retention` is omitted, Rewind keeps exact history with no automatic expiration. This can grow git object storage without bound over time.
 
-### Checkpoints
+## Usage
 
-The extension creates git refs at two points:
+### Rewinding via `/fork`
 
-1. **Session start** - When pi starts, creates a "resume checkpoint" of the current file state
-2. **Each turn** - Before the agent processes each message, creates a checkpoint
-
-Checkpoints are stored as git refs under `refs/pi-checkpoints/` and are scoped per-session (so multiple pi sessions in the same repo don't interfere with each other). Each session maintains its own 100-checkpoint limit.
-
-### Rewinding
-
-To rewind via `/fork`:
-
-1. Type `/fork` in pi
+1. Type `/fork` in Pi
 2. Select a message to branch from
 3. Choose a restore option
 
-To rewind via tree navigation:
+**Options:**
+
+| Option | Files | Conversation |
+|--------|-------|-------------|
+| **Conversation only (keep current files)** | Unchanged | Reset to that point |
+| **Restore all (files + conversation)** | Restored | Reset to that point |
+| **Code only (restore files, keep conversation)** | Restored | Unchanged |
+| **Undo last file rewind** | Restored to before last rewind | Unchanged |
+
+`Restore all`, `Code only`, and `Undo last file rewind` are only shown when an exact rewind point or undo snapshot is available for the selected message.
+
+When you restore files during `/fork`, the undo snapshot is persisted in the **new child session**, because that is where you continue working.
+
+### Rewinding via `/tree`
 
 1. Press `Tab` to open the session tree
 2. Navigate to a different node
 3. Choose a restore option
 
-**For messages from the current session:**
+**Options:**
 
 | Option | Files | Conversation |
-|--------|-------|--------------|
-| **Restore all (files + conversation)** | Restored | Reset to that point |
-| **Conversation only (keep current files)** | Unchanged | Reset to that point |
-| **Code only (restore files, keep conversation)** | Restored | Unchanged |
-| **Undo last file rewind** | Restored to before last rewind | Unchanged |
+|--------|-------|-------------|
+| **Keep current files** | Unchanged | Navigated to that point |
+| **Restore files to that point** | Restored | Navigated to that point |
+| **Undo last file rewind** | Restored to before last rewind | Navigated to that point |
 
-**For messages from before the current session (uses resume checkpoint):**
+If you navigate with `Keep current files`, Rewind still persists the resulting session position's exact current file baseline via `rewind-op.current`.
 
-| Option | Files | Conversation |
-|--------|-------|--------------|
-| **Restore to session start (files + conversation)** | Restored to session start | Reset to that point |
-| **Conversation only (keep current files)** | Unchanged | Reset to that point |
-| **Restore to session start (files only, keep conversation)** | Restored to session start | Unchanged |
-| **Undo last file rewind** | Restored to before last rewind | Unchanged |
+### Examples
 
-### Resumed Sessions
-
-When you resume a session (`pi --resume`), the extension creates a resume checkpoint. If you branch to a message from before the current session, you can restore files to the state when you resumed (not per-message granularity, but a safety net).
-
-## Examples
-
-### Undo a bad refactor
+**Undo a bad refactor:**
 
 ```
 You: refactor the auth module to use JWT
@@ -147,7 +111,7 @@ You: /fork
 Result: Files restored, conversation intact. Try a different approach.
 ```
 
-### Start fresh from a checkpoint
+**Start fresh from an earlier point:**
 
 ```
 You: /fork
@@ -157,42 +121,96 @@ You: /fork
 Result: Both files and conversation reset to that point.
 ```
 
-### Recover after resuming
+## How Rewind works
+
+Rewind stores its ledger in hidden session `custom` entries:
+
+- `rewind-turn` — one per prompt, containing the triggering user-node snapshot plus any assistant-node snapshots produced during that prompt
+- `rewind-op` — sparse records for `/fork`, `/tree`, compaction aliases, summary aliases, and undo state
+
+Snapshots are only considered at visible boundaries:
+
+- the user pre-prompt boundary
+- each assistant `turn_end`
+- selected stateful session operations
+
+Rewind does not create per-tool snapshots.
+
+### Canonical exact rewind points
+
+Exact file restore is available for:
+
+- user nodes
+- assistant nodes
+- compaction nodes aliased to the current exact state
+- branch-summary nodes aliased during `/tree`
+
+Exact file restore is not offered for toolResult nodes.
+
+### Git storage model
+
+Snapshot commits are kept reachable through a single repo-local ref:
+
+```text
+refs/pi-rewind/store
+```
+
+That ref is only for git object reachability; the session ledger is authoritative.
+
+### Deduplication
+
+Before creating a snapshot commit, Rewind captures the worktree tree SHA. If it matches the latest exact snapshot tree, Rewind reuses that existing snapshot commit instead of creating a new one.
+
+### Restore exactness and scope
+
+Rewind restores the exact file state for the snapshot domain it owns:
+
+- tracked files
+- untracked, non-ignored files
+- without staging the real git index during restore
+
+Before restoring target contents, it deletes paths present in the current snapshot but absent from the target snapshot, then restores the target snapshot into the worktree only.
+
+Out of scope:
+
+- ignored files
+- empty directories
+- exact rewind points for `toolResult` nodes
+- exact rewind points for `bashExecution` nodes
+
+## Lineage and resume behavior
+
+Rewind resolves exact rewind points across session lineage by following `parentSession` links and reading rewind metadata from ancestor session files.
+
+Rewind v2 uses only session-native `rewind-turn`/`rewind-op` metadata and does not read legacy checkpoint refs.
+
+## Retention
+
+Retention only affects git reachability. Session JSONL metadata is append-only and is never compacted by Rewind.
+
+When retention is enabled, Rewind keeps snapshot commits alive if they are referenced by:
+
+- a `rewind-turn` or `rewind-op` binding in a discovered same-repo session
+- the latest `rewind-op.current` for a discovered same-repo session
+- the latest `rewind-op.undo` for a discovered same-repo session
+- a labeled bound entry when `pinLabeledEntries` is enabled
+
+If a snapshot commit has been pruned, Rewind validates commit existence before offering restore.
+
+If retention discovery yields an empty live set, Rewind preserves the existing `refs/pi-rewind/store` ref rather than deleting it.
+
+## Viewing storage
+
+Show the store ref head:
 
 ```bash
-pi --resume  # resume old session
+git rev-parse refs/pi-rewind/store
 ```
 
-```
-Agent: [immediately breaks something]
-
-You: /fork
-→ Select any old message
-→ Select "Restore to session start (files only, keep conversation)"
-
-Result: Files restored to state when you resumed.
-```
-
-## Viewing Checkpoints
-
-List all checkpoint refs:
+Show the hidden rewind ledger in a session file:
 
 ```bash
-git for-each-ref refs/pi-checkpoints/
-```
-
-Checkpoint ref format: `checkpoint-{sessionId}-{timestamp}-{entryId}`
-
-Manually restore to a checkpoint (copy ref name from list above):
-
-```bash
-git checkout refs/pi-checkpoints/checkpoint-abc12345-...-... -- .
-```
-
-Delete all checkpoints:
-
-```bash
-git for-each-ref --format='%(refname)' refs/pi-checkpoints/ | xargs -n1 git update-ref -d
+grep '"customType":"rewind-' ~/.pi/agent/sessions/**/*.jsonl
 ```
 
 ## Uninstalling
@@ -201,19 +219,17 @@ git for-each-ref --format='%(refname)' refs/pi-checkpoints/ | xargs -n1 git upda
    ```bash
    rm -rf ~/.pi/agent/extensions/rewind
    ```
-   On Windows (PowerShell): `Remove-Item -Recurse -Force ~/.pi/agent/extensions/rewind`
 
-2. Remove the extension from `~/.pi/agent/settings.json` (delete the line with `rewind/index.ts` from the `extensions` array)
+2. Remove any `rewind` key from `~/.pi/agent/settings.json` if you added one
 
-3. Optionally, clean up git refs in each repo where you used the extension:
+3. Optionally, clean up the git reachability ref in each repo where you used the extension:
    ```bash
-   git for-each-ref --format='%(refname)' refs/pi-checkpoints/ | xargs -n1 git update-ref -d
+   git update-ref -d refs/pi-rewind/store
    ```
 
 ## Limitations
 
 - Only works in git repositories
-- Checkpoints are scoped per-session (multiple sessions in the same repo don't share checkpoints)
-- Resumed sessions only have a single resume checkpoint for pre-session messages
-- Tracks working directory changes only (not staged/committed changes)
-- Each session has its own 100-checkpoint limit (pruning doesn't affect other sessions)
+- Session metadata grows append-only; retention only trims git reachability
+- Discovery for retention is best-effort across discovered Pi session roots and explicit `parentSession` ancestors
+- Ignored files and empty directories are outside the snapshot model

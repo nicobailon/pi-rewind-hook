@@ -1,6 +1,6 @@
 {
   "name": "pi-rewind-hook",
-  "version": "1.7.3",
+  "version": "1.8.0",
   "description": "Rewind extension for Pi agent - automatic git checkpoints with file/conversation restore",
   "bin": {
     "pi-rewind-hook": "./install.js"
@@ -21,8 +21,12 @@
   "author": "nicobailon",
   "license": "MIT",
   "pi": {
-    "extensions": [
-      "./index.ts"
-    ]
+    "extensions": ["./index.ts"]
+  },
+  "scripts": {
+    "test": "npx --yes tsx --tsconfig tsconfig.test.json --test index.test.ts"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.51.0"
   }
 }

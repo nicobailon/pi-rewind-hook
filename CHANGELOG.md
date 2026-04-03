@@ -4,27 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [1.7.3] - 2026-01-26
-
-### Fixed
-- Install script now uses auto-discovery instead of adding to `settings.extensions`
-- Install script now downloads `package.json` with `pi.extensions` declaration
-- Removes rewind from explicit extensions array if present (prevents duplicate loading errors)
-
-## [1.7.2] - 2026-01-26
+## [1.8.0] - 2026-04-03
 
 ### Changed
-- Added `pi-package` keyword for npm discoverability (pi v0.50.0 package system)
+- Replaced the old git-ref checkpoint ledger with session-native `rewind-turn` and `rewind-op` records
+- Rewind points are now aligned to visible session nodes: the triggering user node and each assistant step captured at `turn_end`
+- Snapshot commits are now kept reachable through a single `refs/pi-rewind/store` keepalive ref instead of one ref per checkpoint
+- Removed the fixed 100-checkpoint per-session pruning model; exact mode now has no cap by default
+- `/fork` and `/tree` now persist resulting exact file state through `rewind-op.current`, including keep-current-files flows
+- Undo snapshots now persist with the resulting session state instead of depending on old before-restore refs
 
-## [1.7.1] - 2026-01-22
-
-### Changed
-- Reordered restore menus to show non-file-restorative options first (most common action)
-  - Branch menu: "Conversation only" now appears first
-  - Tree navigation: "Keep current files" now appears first
+### Added
+- Lineage-aware exact snapshot lookup through `parentSession`
+- Exact assistant-node rewind for v2 captures
+- Compaction and branch-summary snapshot aliasing without creating fresh snapshots when files did not change
+- Optional retention over unique snapshot commits via `rewind.retention.maxSnapshots`, `rewind.retention.maxAgeDays`, and `rewind.retention.pinLabeledEntries`
+- Retention discovery mode setting via `rewind.retention.scanMode` (`ancestor-only` default, optional `repo-sessions`)
+- Startup retention sweep budget setting via `rewind.retention.startupBudgetMs`
 
 ### Fixed
-- Resume checkpoint now session-scoped (`checkpoint-resume-{sessionId}-{timestamp}`) for consistency with other checkpoint types
+- Restore now deletes files absent from the target snapshot before worktree-only restore, producing exact restore for tracked and untracked non-ignored files in the snapshot domain without staging the repo index
+- Rewind bookkeeping for reconstruction, capture, migration, and retention no longer depends on UI availability
+- `/tree` restore options now match actual exact rewind availability: user, assistant, compaction, and branch-summary nodes only
+- Critical rewind handlers now fail closed with user-facing errors instead of bubbling git/storage exceptions through `/fork` and `/tree`
+- Turn capture/finalization now warns and recovers when snapshot writes fail, avoiding stale collector state
 
 ## [1.7.0] - 2026-01-15
 
@@ -46,12 +49,12 @@ All notable changes to this project will be documented in this file.
 - Old-format checkpoints are not pruned (to avoid cross-session interference)
 - New checkpoints are created in the new session-scoped format
 
-## [1.6.0] - 2025-01-13
+## [1.6.0] - 2026-01-13
 
 ### Added
 - `rewind.silentCheckpoints` setting to hide checkpoint status and notifications
 
-## [1.5.0] - 2025-01-10
+## [1.5.0] - 2026-01-10
 
 ### Changed
 - Replaced noisy stderr logging with clean TUI output
@@ -97,7 +100,7 @@ All notable changes to this project will be documented in this file.
 - Install script now migrates old hooks config and cleans up old directory
 - Renamed "Hook" to "Extension" throughout codebase and docs
 
-## [1.2.0] - 2025-01-03
+## [1.2.0] - 2026-01-03
 
 ### Added
 - Tree navigation support (`session_before_tree`) - restore files when navigating session tree
@@ -111,13 +114,13 @@ All notable changes to this project will be documented in this file.
 - Removed `agent_end` handler that was clearing checkpoints after each turn
 - "Undo last file rewind" now cancels branch instead of creating unwanted branch
 
-## [1.1.1] - 2024-12-27
+## [1.1.1] - 2025-12-27
 
 ### Fixed
 - Use `before_branch` event instead of `branch` for proper hook timing (thanks @badlogic)
 - Cancel branch when user dismisses restore options menu
 
-## [1.1.0] - 2024-12-27
+## [1.1.0] - 2025-12-27
 
 ### Added
 - "Undo last file rewind" option - restore files to state before last rewind
@@ -131,7 +134,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - Code-only restore options now properly skip conversation restore
 
-## [1.0.0] - 2024-12-19
+## [1.0.0] - 2025-12-19
 
 ### Added
 - Initial release
