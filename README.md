@@ -12,24 +12,24 @@ Rewind metadata lives in the session itself as hidden entries, so rewind history
 
 ## Requirements
 
-- Pi agent v0.35.0+
+- Pi agent v0.65.0+
 - Node.js (for installation)
 - Git repository
 
 ## Installation
 
 ```bash
-npx pi-rewind-hook
+pi install npm:pi-rewind-hook
 ```
 
 This will:
 1. Create `~/.pi/agent/extensions/rewind/`
 2. Download the extension files
-3. Add the extension to your `~/.pi/agent/settings.json`
-4. Migrate any existing hooks config to extensions (if upgrading from an older version)
+3. Auto-discover the extension from the extensions directory (no `settings.json` extension entry required)
+4. Remove legacy hooks/explicit rewind extension entries from `settings.json` if present
 5. Clean up old `hooks/rewind` directory (if present)
 
-Or clone the repo into `~/.pi/agent/extensions/rewind/` — Pi discovers extensions in that directory automatically.
+You can also install with `npx pi-rewind-hook`.
 
 ## Configuration
 

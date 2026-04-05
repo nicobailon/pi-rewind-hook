@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-04-05
+
+### Fixed
+- Migrated lifecycle handling to pi v0.65+ by replacing removed `session_switch`/`session_fork` usage with `session_start` reason-based handling
+- Persisted fork rewind state through `session_start` (`reason: "fork"`) using hidden `rewind-fork-pending` entries so undo/current state is restored in the child session after extension reload
+- Fixed install completion hint to use `/fork` (not deprecated `/branch`)
+- Fixed installer cleanup for Windows-style extension paths when removing explicit rewind entries from `settings.json`
+- Added explicit installer error for redirect responses missing a `location` header
+- Preserved non-`Error` failure messages in installer warning/fatal error output
+
+### Changed
+- Updated README minimum supported pi version to v0.65.0+
+- Clarified README installation flow around auto-discovery and optional legacy settings cleanup
+
 ## [1.8.0] - 2026-04-03
 
 ### Changed

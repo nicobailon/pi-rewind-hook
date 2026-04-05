@@ -14,6 +14,9 @@ function download(url) {
   return new Promise((resolve, reject) => {
     https.get(url, (res) => {
       if (res.statusCode === 301 || res.statusCode === 302) {
+        if (!res.headers.location) {
+          return reject(new Error(`Redirect response missing location header for ${url}`));
+        }
         return download(res.headers.location).then(resolve).catch(reject);
       }
       if (res.statusCode !== 200) {
@@ -61,9 +64,10 @@ async function main() {
       // Remove rewind from explicit extensions (auto-discovery handles it now)
       if (Array.isArray(settings.extensions)) {
         const before = settings.extensions.length;
-        settings.extensions = settings.extensions.filter(p => 
-          !p.includes("/extensions/rewind")
-        );
+        settings.extensions = settings.extensions.filter((p) => {
+          const normalizedPath = String(p).replace(/\\/g, "/");
+          return !normalizedPath.includes("/extensions/rewind");
+        });
         if (settings.extensions.length < before) {
           console.log("Removed rewind from explicit extensions (auto-discovery handles it)");
           modified = true;
@@ -79,7 +83,8 @@ async function main() {
         fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2) + "\n");
       }
     } catch (err) {
-      console.error(`Warning: Could not update settings.json: ${err.message}`);
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`Warning: Could not update settings.json: ${message}`);
     }
   }
 
@@ -92,10 +97,11 @@ async function main() {
 
   console.log("\nInstallation complete!");
   console.log("\nThe extension is auto-discovered from ~/.pi/agent/extensions/rewind/");
-  console.log("Restart pi to load the extension. Use /branch to rewind to a checkpoint.");
+  console.log("Restart pi to load the extension. Use /fork to rewind to a checkpoint.");
 }
 
 main().catch((err) => {
-  console.error(`\nInstallation failed: ${err.message}`);
+  const message = err instanceof Error ? err.message : String(err);
+  console.error(`\nInstallation failed: ${message}`);
   process.exit(1);
 });

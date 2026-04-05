@@ -58,6 +58,12 @@ interface RewindOpData {
   undo?: number;
 }
 
+interface RewindForkPendingData {
+  v: 2;
+  current: string;
+  undo?: string;
+}
+
 interface ActivePromptCollector {
   snapshots: string[];
   bindings: BindingTuple[];
@@ -98,6 +104,7 @@ interface ParsedSessionLedger {
   references: ParsedLedgerReference[];
   latestCurrentCommitSha?: string;
   latestUndoCommitSha?: string;
+  latestForkPending?: RewindForkPendingData;
 }
 
 interface SessionLikeMessageEntry {
@@ -210,6 +217,12 @@ function isRewindOpData(value: unknown): value is RewindOpData {
   if (!value || typeof value !== "object") return false;
   const data = value as Partial<RewindOpData>;
   return data.v === 2 && Array.isArray(data.snapshots);
+}
+
+function isRewindForkPendingData(value: unknown): value is RewindForkPendingData {
+  if (!value || typeof value !== "object") return false;
+  const data = value as Partial<RewindForkPendingData>;
+  return data.v === 2 && typeof data.current === "string" && data.current.length > 0;
 }
 
 function canonicalizePath(value: string): string {
@@ -377,12 +390,11 @@ export default function rewindExtension(pi: ExtensionAPI) {
   let lastExact: ExactState | null = null;
   let activeBranchState: ActiveBranchState = {};
   let promptCollector: ActivePromptCollector | null = null;
-  let pendingForkState: PendingResultingState | null = null;
   let pendingTreeState: PendingResultingState | null = null;
   let activePromptText: string | null = null;
-    let newSnapshotsSinceSweep = 0;
-    let sweepRunning = false;
-    let sweepCompletedThisSession = false;
+  let newSnapshotsSinceSweep = 0;
+  let sweepRunning = false;
+  let sweepCompletedThisSession = false;
   let forceConversationOnlyOnNextFork = false;
   let forceConversationOnlySource: string | null = null;
 
@@ -419,11 +431,10 @@ export default function rewindExtension(pi: ExtensionAPI) {
     lastExact = null;
     activeBranchState = {};
     promptCollector = null;
-    pendingForkState = null;
     pendingTreeState = null;
-      activePromptText = null;
-      newSnapshotsSinceSweep = 0;
-      sweepCompletedThisSession = false;
+    activePromptText = null;
+    newSnapshotsSinceSweep = 0;
+    sweepCompletedThisSession = false;
     forceConversationOnlyOnNextFork = false;
     forceConversationOnlySource = null;
     cachedSettings = null;
@@ -672,6 +683,19 @@ export default function rewindExtension(pi: ExtensionAPI) {
     updateStatus(ctx);
   }
 
+  function appendForkPendingState(data: PendingResultingState) {
+    const forkPending: RewindForkPendingData = {
+      v: RETENTION_VERSION,
+      current: data.currentCommitSha,
+    };
+
+    if (data.undoCommitSha) {
+      forkPending.undo = data.undoCommitSha;
+    }
+
+    pi.appendEntry("rewind-fork-pending", forkPending);
+  }
+
   function buildCurrentSessionLedger(ctx: ExtensionContext): ParsedSessionLedger {
     const ledger: ParsedSessionLedger = {
       sessionFile: currentSessionFile ?? "",
@@ -697,6 +721,11 @@ export default function rewindExtension(pi: ExtensionAPI) {
         if (currentCommitSha) ledger.latestCurrentCommitSha = currentCommitSha;
         const undoCommitSha = getCommitFromData(rawEntry.data, "undo");
         if (undoCommitSha) ledger.latestUndoCommitSha = undoCommitSha;
+        continue;
+      }
+
+      if (rawEntry.type === "custom" && rawEntry.customType === "rewind-fork-pending" && isRewindForkPendingData(rawEntry.data)) {
+        ledger.latestForkPending = rawEntry.data;
         continue;
       }
 
@@ -782,6 +811,11 @@ export default function rewindExtension(pi: ExtensionAPI) {
           if (currentCommitSha) ledger.latestCurrentCommitSha = currentCommitSha;
           const undoCommitSha = getCommitFromData(entry.data, "undo");
           if (undoCommitSha) ledger.latestUndoCommitSha = undoCommitSha;
+          continue;
+        }
+
+        if (entry?.type === "custom" && entry?.customType === "rewind-fork-pending" && isRewindForkPendingData(entry.data)) {
+          ledger.latestForkPending = entry.data;
           continue;
         }
 
@@ -1093,31 +1127,32 @@ export default function rewindExtension(pi: ExtensionAPI) {
     activePromptText = event.prompt;
   });
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     await initializeForSession(ctx);
-  });
 
-  pi.on("session_switch", async (_event, ctx) => {
-    await initializeForSession(ctx);
-  });
-
-  pi.on("session_fork", async (_event, ctx) => {
-    syncSessionIdentity(ctx);
-    if (!isGitRepo || !pendingForkState) {
-      await reconstructState(ctx);
-      updateStatus(ctx);
+    if (event.reason !== "fork" || !event.previousSessionFile || !isGitRepo) {
       return;
     }
 
-    const snapshots = [pendingForkState.currentCommitSha];
+    const previousLedger = await parseSessionLedgerFile(event.previousSessionFile);
+    const pendingFork = previousLedger?.latestForkPending;
+    if (!pendingFork) {
+      return;
+    }
+
+    if (!(await commitExists(pendingFork.current))) {
+      return;
+    }
+
+    const snapshots = [pendingFork.current];
     const data: RewindOpData = { v: RETENTION_VERSION, snapshots, current: 0 };
-    if (pendingForkState.undoCommitSha) {
-      data.snapshots.push(pendingForkState.undoCommitSha);
+
+    if (pendingFork.undo && (await commitExists(pendingFork.undo))) {
+      data.snapshots.push(pendingFork.undo);
       data.undo = 1;
     }
 
     appendRewindOp(ctx, data);
-    pendingForkState = null;
     await reconstructState(ctx);
     updateStatus(ctx);
   });
@@ -1238,7 +1273,8 @@ export default function rewindExtension(pi: ExtensionAPI) {
 
     try {
       if (!ctx.hasUI) {
-        pendingForkState = { currentCommitSha: await ensureSnapshotForCurrentWorktree() };
+        const nextState = { currentCommitSha: await ensureSnapshotForCurrentWorktree() };
+        appendForkPendingState(nextState);
         return;
       }
 
@@ -1246,7 +1282,8 @@ export default function rewindExtension(pi: ExtensionAPI) {
       const hasUndo = Boolean(activeBranchState.undoCommitSha && (await commitExists(activeBranchState.undoCommitSha)));
 
       if (shouldForceConversationOnly) {
-        pendingForkState = { currentCommitSha: await ensureSnapshotForCurrentWorktree() };
+        const nextState = { currentCommitSha: await ensureSnapshotForCurrentWorktree() };
+        appendForkPendingState(nextState);
         notify(ctx, `Rewind: using conversation-only fork (keep current files)${forcedBySource ? ` (${forcedBySource})` : ""}`);
         return;
       }
@@ -1267,16 +1304,18 @@ export default function rewindExtension(pi: ExtensionAPI) {
 
       if (choice === "Undo last file rewind") {
         const restore = await restoreCommitExactly(activeBranchState.undoCommitSha!);
-        pendingForkState = {
+        const nextState = {
           currentCommitSha: activeBranchState.undoCommitSha!,
           undoCommitSha: restore.undoCommitSha,
         };
+        appendForkPendingState(nextState);
         notify(ctx, "Files restored to before last rewind");
         return;
       }
 
       if (choice === "Conversation only (keep current files)") {
-        pendingForkState = { currentCommitSha: await ensureSnapshotForCurrentWorktree() };
+        const nextState = { currentCommitSha: await ensureSnapshotForCurrentWorktree() };
+        appendForkPendingState(nextState);
         return;
       }
 
@@ -1286,17 +1325,17 @@ export default function rewindExtension(pi: ExtensionAPI) {
       }
 
       const restore = await restoreCommitExactly(targetCommitSha);
-      pendingForkState = {
+      const nextState = {
         currentCommitSha: targetCommitSha,
         undoCommitSha: restore.undoCommitSha,
       };
+      appendForkPendingState(nextState);
       notify(ctx, "Files restored from rewind point");
 
       if (choice === "Code only (restore files, keep conversation)") {
         return { skipConversationRestore: true };
       }
     } catch (error) {
-      pendingForkState = null;
       notify(ctx, `Rewind failed before fork: ${error instanceof Error ? error.message : String(error)}`, "error");
       return { cancel: true };
     }

@@ -327,11 +327,12 @@ test("/fork undo restores files into a child session instead of cancelling the f
     const currentSessionRewindOps = harness.currentSession.getEntries().filter((entry) => entry.type === "custom" && entry.customType === "rewind-op");
     assert.equal(currentSessionRewindOps.length, 1);
 
+    const previousSessionFile = harness.currentSession.getSessionFile();
     const childSession = harness.createSession({
       id: "session-2",
-      parentSession: harness.currentSession.getSessionFile(),
+      parentSession: previousSessionFile,
     });
-    await harness.invoke("session_fork", {}, childSession);
+    await harness.invoke("session_start", { reason: "fork", previousSessionFile }, childSession);
 
     const childRewindOps = childSession.getEntries().filter((entry) => entry.type === "custom" && entry.customType === "rewind-op");
     assert.equal(childRewindOps.length, 1);
