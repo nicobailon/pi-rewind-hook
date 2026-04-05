@@ -29,8 +29,6 @@ This will:
 4. Remove legacy hooks/explicit rewind extension entries from `settings.json` if present
 5. Clean up old `hooks/rewind` directory (if present)
 
-You can also install with `npx pi-rewind-hook`.
-
 ## Configuration
 
 Optionally add settings to `~/.pi/agent/settings.json`.  For example:

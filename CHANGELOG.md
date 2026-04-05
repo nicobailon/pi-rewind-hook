@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-04-05
+
+### Changed
+- Dropped `npx pi-rewind-hook` installer support; package install path is now `pi install npm:pi-rewind-hook`
+
 ## [1.8.1] - 2026-04-05
 
 ### Fixed
