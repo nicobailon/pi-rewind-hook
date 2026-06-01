@@ -767,8 +767,6 @@ export default function rewindExtension(pi: ExtensionAPI) {
               break;
             }
           } catch {
-            // Ignore malformed header lines from partial/corrupt session files.
-            continue;
           }
         }
         parsedSessionCache.set(sessionFile, { mtimeMs: fileStat.mtimeMs, ledger });
@@ -1123,18 +1121,31 @@ export default function rewindExtension(pi: ExtensionAPI) {
     }
 
     if (!isGitRepo) {
-      // Fallback: use ~/.pi/agent/rewind-data/ as a dedicated git repo
+      // Fallback: auto-create and use ~/.pi/agent/rewind-data/ as a dedicated git repo
       const rewindDir = process.env.HOME + "/.pi/agent/rewind-data";
       try {
+        // Check if it's already a git repo
         const result = await pi.exec("git", ["-C", rewindDir, "rev-parse", "--is-inside-work-tree"]);
         isGitRepo = result.code === 0 && result.stdout.trim() === "true";
-        if (isGitRepo) {
-          process.env.GIT_DIR = rewindDir + "/.git";
-          process.env.GIT_WORK_TREE = rewindDir;
-          usingFallbackRepo = true;
-        }
       } catch {
-        isGitRepo = false;
+        // Doesn't exist or not a git repo — create it
+        try {
+          await pi.exec("mkdir", ["-p", rewindDir]);
+          await pi.exec("git", ["init", rewindDir]);
+          await pi.exec("git", ["-C", rewindDir, "config", "user.email", "rewind@pi.dev"]);
+          await pi.exec("git", ["-C", rewindDir, "config", "user.name", "pi-rewind"]);
+          await pi.exec("sh", ["-c", "echo -n > " + rewindDir + "/.session"]);
+          await pi.exec("git", ["-C", rewindDir, "add", "-A"]);
+          await pi.exec("git", ["-C", rewindDir, "commit", "-m", "init"]);
+          isGitRepo = true;
+        } catch {
+          isGitRepo = false;
+        }
+      }
+      if (isGitRepo) {
+        process.env.GIT_DIR = rewindDir + "/.git";
+        process.env.GIT_WORK_TREE = rewindDir;
+        usingFallbackRepo = true;
       }
     }
 
