@@ -422,6 +422,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
     currentParentSession = undefined;
     currentSessionCwd = undefined;
     isGitRepo = false;
+    usingFallbackRepo = false;
     lastExact = null;
     activeBranchState = {};
     promptCollector = null;
@@ -999,7 +1000,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
 
       const ledger = sessionFile === currentSessionFile ? buildCurrentSessionLedger(ctx) : await parseSessionLedgerFile(sessionFile);
       if (!ledger?.cwd) continue;
-      if (!isInsidePath(ledger.cwd, repoRoot)) continue;
+      if (!usingFallbackRepo && !isInsidePath(ledger.cwd, repoRoot)) continue;
       ledgers.push(ledger);
     }
 
@@ -1107,6 +1108,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
     await reconstructState(ctx);
     updateStatus(ctx);
   }
+  let usingFallbackRepo = false;
 
   async function initializeForSession(ctx: ExtensionContext) {
     activeContext = ctx;
@@ -1117,8 +1119,23 @@ export default function rewindExtension(pi: ExtensionAPI) {
       const result = await pi.exec("git", ["rev-parse", "--is-inside-work-tree"]);
       isGitRepo = result.code === 0 && result.stdout.trim() === "true";
     } catch {
-      // Treat git probing failures as non-git context for this session.
       isGitRepo = false;
+    }
+
+    if (!isGitRepo) {
+      // Fallback: use ~/.pi/agent/rewind-data/ as a dedicated git repo
+      const rewindDir = process.env.HOME + "/.pi/agent/rewind-data";
+      try {
+        const result = await pi.exec("git", ["-C", rewindDir, "rev-parse", "--is-inside-work-tree"]);
+        isGitRepo = result.code === 0 && result.stdout.trim() === "true";
+        if (isGitRepo) {
+          process.env.GIT_DIR = rewindDir + "/.git";
+          process.env.GIT_WORK_TREE = rewindDir;
+          usingFallbackRepo = true;
+        }
+      } catch {
+        isGitRepo = false;
+      }
     }
 
     if (!isGitRepo) {
@@ -1133,6 +1150,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
       notify(ctx, `Rewind retention startup sweep failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
     });
   }
+
 
   pi.events.on("rewind:fork-preference", (data) => {
     if (!data || typeof data !== "object") return;
