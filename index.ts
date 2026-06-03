@@ -553,16 +553,16 @@ export default function rewindExtension(pi: ExtensionAPI) {
 				"HEAD",
 			]);
 			if (diffResult.code === 0) {
-				// Also check for untracked files (git diff-index only checks tracked files)
+				// Also check for untracked files (git diff-index only detects changes to tracked files)
 				const untracked = await pi.exec("git", [
-						"ls-files",
-						"--others",
-						"--exclude-standard",
+					"ls-files",
+					"--others",
+					"--exclude-standard",
 				]);
 				if (untracked.stdout.trim() === "") {
-						// No untracked files, safe to use real index
-						const { stdout } = await execAsync("git write-tree", { cwd: root });
-						return { treeSha: stdout.trim() };
+					// No untracked files, safe to use real index
+					const { stdout } = await execAsync("git write-tree", { cwd: root });
+					return { treeSha: stdout.trim() };
 				}
 				// Has untracked files, fall through to full capture
 			}
@@ -747,9 +747,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
 		return result.stdout.split("\0").filter(Boolean);
 	}
 
-	async function restoreCommitExactly(
-		targetCommitSha: string,
-	): Promise<{
+	async function restoreCommitExactly(targetCommitSha: string): Promise<{
 		changed: boolean;
 		undoCommitSha?: string;
 		targetTreeSha: string;
