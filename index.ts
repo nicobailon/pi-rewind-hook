@@ -547,12 +547,9 @@ export default function rewindExtension(pi: ExtensionAPI) {
 		// entirely. Just write the tree from the real index. This avoids the 7-8s
 		// `git add -A` bottleneck on large repos during clone/fork operations.
 		try {
-			const diffResult = await pi.exec("git", [
-				"diff-files",
-				"--quiet",
-			]);
+			const diffResult = await pi.exec("git", ["diff-files", "--quiet"]);
 			if (diffResult.code === 0) {
-				// Also check for untracked files (git diff-index only detects changes to tracked files)
+				// Also check for untracked files (git diff-files only detects changes to tracked files)
 				const untracked = await pi.exec("git", [
 					"ls-files",
 					"--others",
