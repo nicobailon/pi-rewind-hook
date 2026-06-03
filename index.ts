@@ -542,15 +542,14 @@ export default function rewindExtension(pi: ExtensionAPI) {
 	async function captureWorktreeTree(): Promise<{ treeSha: string }> {
 		const root = await getRepoRoot(pi.exec);
 
-		// Fast path: if the git index is already in sync with HEAD (clean worktree,
-		// no staged/unstaged changes), skip the expensive `git add -A` staging scan
+		// Fast path: if the git index is already in sync with the working tree
+		// (no staged/unstaged changes), skip the expensive `git add -A` staging scan
 		// entirely. Just write the tree from the real index. This avoids the 7-8s
 		// `git add -A` bottleneck on large repos during clone/fork operations.
 		try {
 			const diffResult = await pi.exec("git", [
-				"diff-index",
+				"diff-files",
 				"--quiet",
-				"HEAD",
 			]);
 			if (diffResult.code === 0) {
 				// Also check for untracked files (git diff-index only detects changes to tracked files)
