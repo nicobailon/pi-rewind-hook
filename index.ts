@@ -898,14 +898,11 @@ export default function rewindExtension(pi: ExtensionAPI) {
 
     if (activeBranchState.currentCommitSha && (await commitExists(activeBranchState.currentCommitSha))) {
       activeBranchState.currentTreeSha = await getCommitTreeSha(activeBranchState.currentCommitSha);
-      const { treeSha: worktreeTreeSha } = await captureWorktreeTree();
-
-      if (activeBranchState.currentTreeSha === worktreeTreeSha) {
-        lastExact = {
-          commitSha: activeBranchState.currentCommitSha,
-          treeSha: activeBranchState.currentTreeSha,
-        };
-      }
+      // Skip captureWorktreeTree() during reconstructState — it runs `git add -A`
+      // on the entire working tree which can take 5-7s on large repos.
+      // lastExact will be lazily populated on the first actual snapshot capture
+      // (ensureSnapshotForTree), which only happens during active turns.
+      lastExact = null;
     }
   }
 
