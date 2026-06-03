@@ -553,8 +553,18 @@ export default function rewindExtension(pi: ExtensionAPI) {
 				"HEAD",
 			]);
 			if (diffResult.code === 0) {
-				const { stdout } = await execAsync("git write-tree", { cwd: root });
-				return { treeSha: stdout.trim() };
+				// Also check for untracked files (git diff-index only checks tracked files)
+				const untracked = await pi.exec("git", [
+						"ls-files",
+						"--others",
+						"--exclude-standard",
+				]);
+				if (untracked.stdout.trim() === "") {
+						// No untracked files, safe to use real index
+						const { stdout } = await execAsync("git write-tree", { cwd: root });
+						return { treeSha: stdout.trim() };
+				}
+				// Has untracked files, fall through to full capture
 			}
 		} catch {
 			// Fall through to full capture if the fast path fails.
