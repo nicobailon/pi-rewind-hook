@@ -5,7 +5,7 @@
     "moduleResolution": "Bundler",
     "baseUrl": ".",
     "paths": {
-      "@mariozechner/pi-coding-agent": ["./test-support/pi-coding-agent-shim.ts"]
+      "@earendil-works/pi-coding-agent": ["./test-support/pi-coding-agent-shim.ts"]
     }
   }
 }

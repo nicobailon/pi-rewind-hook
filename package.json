@@ -24,6 +24,6 @@
     "test": "npx --yes tsx --tsconfig tsconfig.test.json --test index.test.ts"
   },
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "^0.51.0"
+    "@earendil-works/pi-coding-agent": "^0.51.0"
   }
 }
