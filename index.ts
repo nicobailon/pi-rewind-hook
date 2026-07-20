@@ -387,7 +387,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
   let pendingTreeState: PendingResultingState | null = null;
   let activePromptText: string | null = null;
   let newSnapshotsSinceSweep = 0;
-  let sweepRunning = false;
+  let retentionSweep: Promise<void> | undefined;
   let sweepCompletedThisSession = false;
   let forceConversationOnlyOnNextFork = false;
   let forceConversationOnlySource: string | null = null;
@@ -964,13 +964,13 @@ export default function rewindExtension(pi: ExtensionAPI) {
     if (reason === "new-snapshots" && newSnapshotsSinceSweep < RETENTION_SWEEP_THRESHOLD) return;
     if (reason === "shutdown" && sweepCompletedThisSession && newSnapshotsSinceSweep < RETENTION_SWEEP_THRESHOLD) return;
     if (!repoRoot) return;
-    if (sweepRunning) return;
-    sweepRunning = true;
-    try {
-      await runRetentionSweep(ctx, reason);
-    } finally {
-      sweepRunning = false;
-    }
+    // Session replacement invalidates ctx after session_shutdown resolves, so reuse
+    // the in-flight startup sweep and let shutdown await it before returning.
+    if (retentionSweep) return retentionSweep;
+    retentionSweep = runRetentionSweep(ctx, reason).finally(() => {
+      retentionSweep = undefined;
+    });
+    return retentionSweep;
   }
 
   async function runRetentionSweep(ctx: ExtensionContext, reason: "startup" | "new-snapshots" | "shutdown") {
