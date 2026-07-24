@@ -823,3 +823,55 @@ test("retention rewrites the keepalive ref when a live snapshot exists", async (
     await harness.cleanup();
   }
 });
+
+test("retention retries a ref rewrite that races with a new snapshot", async () => {
+  const harness = await createHarness({
+    settings: { rewind: { retention: { maxSnapshots: 10 } } },
+    pauseGitSubcommand: { name: "update-ref", occurrence: 1 },
+  });
+
+  try {
+    await harness.writeRepoFile("tracked.txt", "stale state\n");
+    const staleCommit = await harness.captureSnapshot();
+    await harness.writeRepoFile("tracked.txt", "live state\n");
+    const liveCommit = await harness.captureSnapshot();
+    await harness.writeRepoFile("tracked.txt", "concurrent state\n");
+    const concurrentCommit = await harness.captureSnapshot();
+    await harness.updateStoreRef(staleCommit);
+
+    harness.currentSession.replaceEntries([
+      {
+        type: "custom",
+        id: "rewind-op-1",
+        parentId: null,
+        timestamp: new Date().toISOString(),
+        customType: "rewind-op",
+        data: { v: 2, snapshots: [liveCommit], current: 0 },
+      },
+    ]);
+
+    await harness.invoke("session_start", {});
+    await harness.waitForPausedGitCall();
+    await harness.updateStoreRef(concurrentCommit);
+    harness.resumePausedGitCall();
+
+    const deadline = Date.now() + 3000;
+    let storeHead: string | undefined;
+    while (Date.now() < deadline) {
+      storeHead = await harness.revParseStore();
+      if (storeHead
+        && await harness.isAncestor(liveCommit, storeHead)
+        && await harness.isAncestor(concurrentCommit, storeHead)) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    assert.ok(storeHead);
+    assert.equal(await harness.isAncestor(liveCommit, storeHead), true);
+    assert.equal(await harness.isAncestor(concurrentCommit, storeHead), true);
+    assert.equal(harness.notifications.some(({ message }) => message.includes("retention startup sweep failed")), false);
+  } finally {
+    await harness.cleanup();
+  }
+});

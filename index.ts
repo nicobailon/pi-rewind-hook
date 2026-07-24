@@ -542,19 +542,38 @@ export default function rewindExtension(pi: ExtensionAPI) {
       return "preserved-empty";
     }
 
-    let head: string | undefined;
-    for (const commitSha of uniqueLiveCommits) {
-      head = await createStoreKeepaliveCommit(commitSha, head);
+    let attempts = 0;
+    let lastError: unknown;
+    let preserveConcurrentHead = false;
+
+    while (attempts < 5) {
+      attempts += 1;
+      const oldHead = await getStoreHead();
+      // A failed compare-and-swap means another session added snapshots while
+      // this sweep was running. Preserve that new reachability and let a later
+      // uncontended sweep prune anything no longer retained.
+      let head = preserveConcurrentHead ? oldHead : undefined;
+      for (const commitSha of uniqueLiveCommits) {
+        head = await createStoreKeepaliveCommit(commitSha, head);
+      }
+
+      try {
+        if (oldHead) {
+          await execGitChecked(["update-ref", STORE_REF, head!, oldHead]);
+        } else {
+          await execGitChecked(["update-ref", STORE_REF, head!, LEGACY_ZERO_SHA]);
+        }
+        return "rewritten";
+      } catch (error) {
+        // Retry if another process updated the store ref concurrently.
+        // Keep the most recent error for actionable failure context.
+        lastError = error;
+        preserveConcurrentHead = true;
+      }
     }
 
-    const oldHead = await getStoreHead();
-    if (oldHead) {
-      await execGitChecked(["update-ref", STORE_REF, head!, oldHead]);
-      return "rewritten";
-    }
-
-    await execGitChecked(["update-ref", STORE_REF, head!, LEGACY_ZERO_SHA]);
-    return "rewritten";
+    const detail = lastError instanceof Error ? lastError.message : String(lastError);
+    throw new Error(`failed to rewrite rewind store ref: ${detail}`);
   }
 
   async function ensureSnapshotForTree(treeSha: string): Promise<string> {
