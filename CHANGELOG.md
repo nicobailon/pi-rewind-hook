@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Interactive restore and keep-current operations now show immediate progress after an option is confirmed.
+
 ## [1.8.5] - 2026-07-28
 
 ### Changed

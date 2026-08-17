@@ -390,6 +390,7 @@ test("session_before_fork gracefully cancels when restore fails", async () => {
       harness.notifications.some((entry) => entry.level === "error" && entry.message.includes("Rewind failed before fork")),
       true,
     );
+    assert.equal(harness.statusUpdates.some((update) => update.key.startsWith("rewind-progress")), false);
   } finally {
     await harness.cleanup();
   }
@@ -397,7 +398,6 @@ test("session_before_fork gracefully cancels when restore fails", async () => {
 
 test("session_before_tree gracefully cancels when restore fails", async () => {
   const harness = await createHarness({
-    settings: { rewind: { silentCheckpoints: true } },
     failGitSubcommands: ["restore"],
   });
 
@@ -433,15 +433,19 @@ test("session_before_tree gracefully cancels when restore fails", async () => {
       harness.notifications.some((entry) => entry.level === "error" && entry.message.includes("Rewind failed before tree navigation")),
       true,
     );
+    assert.deepEqual(
+      harness.statusUpdates
+        .filter((update) => update.key.startsWith("rewind-progress"))
+        .map((update) => update.value),
+      ["Restoring files...", undefined],
+    );
   } finally {
     await harness.cleanup();
   }
 });
 
 test("session_before_tree restores directly from a custom message with a checkpoint", async () => {
-  const harness = await createHarness({
-    settings: { rewind: { silentCheckpoints: true } },
-  });
+  const harness = await createHarness();
 
   try {
     await harness.writeRepoFile("notes.txt", "target state\n");
@@ -475,6 +479,43 @@ test("session_before_tree restores directly from a custom message with a checkpo
     assert.equal(result, undefined);
     assert.equal(harness.readRepoFile("notes.txt"), "target state\n");
     assert.deepEqual(harness.selectCalls[0]?.options, ["Keep current files", "Restore files to that point", "Cancel navigation"]);
+    assert.deepEqual(
+      harness.statusUpdates
+        .filter((update) => update.key.startsWith("rewind-progress"))
+        .map((update) => update.value),
+      ["Restoring files...", undefined],
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("session_before_tree shows progress while saving the current file state", async () => {
+  const harness = await createHarness();
+
+  try {
+    await harness.writeRepoFile("notes.txt", "current state\n");
+    harness.currentSession.replaceEntries([
+      {
+        type: "message",
+        id: "user-1",
+        parentId: null,
+        timestamp: new Date().toISOString(),
+        message: { role: "user", content: [{ type: "text", text: "Tree target" }] },
+      },
+    ]);
+
+    await harness.invoke("session_start", {});
+    harness.enqueueSelection("Keep current files");
+
+    const result = await harness.invoke("session_before_tree", { preparation: { targetId: "user-1" } });
+    assert.equal(result, undefined);
+    assert.deepEqual(
+      harness.statusUpdates
+        .filter((update) => update.key.startsWith("rewind-progress"))
+        .map((update) => update.value),
+      ["Saving current file state...", undefined],
+    );
   } finally {
     await harness.cleanup();
   }
@@ -501,7 +542,18 @@ test("rewind:checkpoint-entry binds the current tree to a custom message", async
 
     await harness.invoke("session_start", {});
     harness.eventHandlers.get("rewind:checkpoint-entry")?.({ source: "pi-custom-compaction", entryId: "marker-1" });
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    const checkpointDeadline = Date.now() + 3000;
+    while (
+      !harness.currentSession.getEntries().some((entry) => entry.type === "custom" && entry.customType === "rewind-op") &&
+      Date.now() < checkpointDeadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(
+      harness.currentSession.getEntries().some((entry) => entry.type === "custom" && entry.customType === "rewind-op"),
+      true,
+      "checkpoint event did not finish",
+    );
     await harness.writeRepoFile("notes.txt", "current state\n");
 
     harness.enqueueSelection("Restore files to that point");

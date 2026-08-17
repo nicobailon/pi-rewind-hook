@@ -10,6 +10,8 @@ const execAsync = promisify(execCb);
 
 const STORE_REF = "refs/pi-rewind/store";
 const STATUS_KEY = "rewind";
+const PROGRESS_STATUS_KEY_PREFIX = "rewind-progress";
+let progressOperationId = 0;
 const FORK_PREFERENCE_SOURCE_ALLOWLIST = new Set(["fork-from-first"]);
 const CHECKPOINT_SOURCE_ALLOWLIST = new Set(["pi-custom-compaction"]);
 const LEGACY_ZERO_SHA = "0000000000000000000000000000000000000000";
@@ -183,6 +185,20 @@ function getSettings(): RewindSettings {
 
 function getSilentCheckpointsSetting(): boolean {
   return getSettings().rewind?.silentCheckpoints === true;
+}
+
+async function withProgress<T>(ctx: ExtensionContext, message: string, operation: () => Promise<T>): Promise<T> {
+  if (!ctx.hasUI || getSilentCheckpointsSetting()) {
+    return operation();
+  }
+
+  const statusKey = `${PROGRESS_STATUS_KEY_PREFIX}-${++progressOperationId}`;
+  ctx.ui.setStatus(statusKey, ctx.ui.theme.fg("muted", message));
+  try {
+    return await operation();
+  } finally {
+    ctx.ui.setStatus(statusKey, undefined);
+  }
 }
 
 function getRetentionSettings(): RewindRetentionSettings | undefined {
@@ -1336,7 +1352,9 @@ export default function rewindExtension(pi: ExtensionAPI) {
       }
 
       if (choice === "Undo last file rewind") {
-        const restore = await restoreCommitExactly(activeBranchState.undoCommitSha!);
+        const restore = await withProgress(ctx, "Restoring files...", () =>
+          restoreCommitExactly(activeBranchState.undoCommitSha!),
+        );
         const nextState = {
           currentCommitSha: activeBranchState.undoCommitSha!,
           undoCommitSha: restore.undoCommitSha,
@@ -1347,7 +1365,10 @@ export default function rewindExtension(pi: ExtensionAPI) {
       }
 
       if (choice === "Conversation only (keep current files)") {
-        const nextState = { currentCommitSha: await ensureSnapshotForCurrentWorktree() };
+        const currentCommitSha = await withProgress(ctx, "Saving current file state...", () =>
+          ensureSnapshotForCurrentWorktree(),
+        );
+        const nextState = { currentCommitSha };
         appendForkPendingState(nextState);
         return;
       }
@@ -1357,7 +1378,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
         return { cancel: true };
       }
 
-      const restore = await restoreCommitExactly(targetCommitSha);
+      const restore = await withProgress(ctx, "Restoring files...", () => restoreCommitExactly(targetCommitSha));
       const nextState = {
         currentCommitSha: targetCommitSha,
         undoCommitSha: restore.undoCommitSha,
@@ -1407,7 +1428,9 @@ export default function rewindExtension(pi: ExtensionAPI) {
       }
 
       if (choice === "Undo last file rewind") {
-        const restore = await restoreCommitExactly(activeBranchState.undoCommitSha!);
+        const restore = await withProgress(ctx, "Restoring files...", () =>
+          restoreCommitExactly(activeBranchState.undoCommitSha!),
+        );
         const snapshots = [activeBranchState.undoCommitSha!];
         const data: RewindOpData = { v: RETENTION_VERSION, snapshots, current: 0 };
         if (restore.undoCommitSha) {
@@ -1421,7 +1444,10 @@ export default function rewindExtension(pi: ExtensionAPI) {
       }
 
       if (choice === "Keep current files") {
-        pendingTreeState = { currentCommitSha: await ensureSnapshotForCurrentWorktree() };
+        const currentCommitSha = await withProgress(ctx, "Saving current file state...", () =>
+          ensureSnapshotForCurrentWorktree(),
+        );
+        pendingTreeState = { currentCommitSha };
         return;
       }
 
@@ -1430,7 +1456,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
         return { cancel: true };
       }
 
-      const restore = await restoreCommitExactly(targetCommitSha);
+      const restore = await withProgress(ctx, "Restoring files...", () => restoreCommitExactly(targetCommitSha));
       pendingTreeState = {
         currentCommitSha: targetCommitSha,
         undoCommitSha: restore.undoCommitSha,
