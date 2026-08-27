@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Retention now waits for in-flight startup sweeps during session replacement and preserves concurrent keepalive-ref updates. Thanks to [@jesseylin](https://github.com/jesseylin) for #11.
+
 ## [1.8.5] - 2026-07-28
 
 ### Changed

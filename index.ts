@@ -387,7 +387,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
   let pendingTreeState: PendingResultingState | null = null;
   let activePromptText: string | null = null;
   let newSnapshotsSinceSweep = 0;
-  let sweepRunning = false;
+  let retentionSweep: Promise<void> | undefined;
   let sweepCompletedThisSession = false;
   let forceConversationOnlyOnNextFork = false;
   let forceConversationOnlySource: string | null = null;
@@ -542,19 +542,38 @@ export default function rewindExtension(pi: ExtensionAPI) {
       return "preserved-empty";
     }
 
-    let head: string | undefined;
-    for (const commitSha of uniqueLiveCommits) {
-      head = await createStoreKeepaliveCommit(commitSha, head);
+    let attempts = 0;
+    let lastError: unknown;
+    let preserveConcurrentHead = false;
+
+    while (attempts < 5) {
+      attempts += 1;
+      const oldHead = await getStoreHead();
+      // A failed compare-and-swap means another session added snapshots while
+      // this sweep was running. Preserve that new reachability and let a later
+      // uncontended sweep prune anything no longer retained.
+      let head = preserveConcurrentHead ? oldHead : undefined;
+      for (const commitSha of uniqueLiveCommits) {
+        head = await createStoreKeepaliveCommit(commitSha, head);
+      }
+
+      try {
+        if (oldHead) {
+          await execGitChecked(["update-ref", STORE_REF, head!, oldHead]);
+        } else {
+          await execGitChecked(["update-ref", STORE_REF, head!, LEGACY_ZERO_SHA]);
+        }
+        return "rewritten";
+      } catch (error) {
+        // Retry if another process updated the store ref concurrently.
+        // Keep the most recent error for actionable failure context.
+        lastError = error;
+        preserveConcurrentHead = true;
+      }
     }
 
-    const oldHead = await getStoreHead();
-    if (oldHead) {
-      await execGitChecked(["update-ref", STORE_REF, head!, oldHead]);
-      return "rewritten";
-    }
-
-    await execGitChecked(["update-ref", STORE_REF, head!, LEGACY_ZERO_SHA]);
-    return "rewritten";
+    const detail = lastError instanceof Error ? lastError.message : String(lastError);
+    throw new Error(`failed to rewrite rewind store ref: ${detail}`);
   }
 
   async function ensureSnapshotForTree(treeSha: string): Promise<string> {
@@ -964,13 +983,13 @@ export default function rewindExtension(pi: ExtensionAPI) {
     if (reason === "new-snapshots" && newSnapshotsSinceSweep < RETENTION_SWEEP_THRESHOLD) return;
     if (reason === "shutdown" && sweepCompletedThisSession && newSnapshotsSinceSweep < RETENTION_SWEEP_THRESHOLD) return;
     if (!repoRoot) return;
-    if (sweepRunning) return;
-    sweepRunning = true;
-    try {
-      await runRetentionSweep(ctx, reason);
-    } finally {
-      sweepRunning = false;
-    }
+    // Session replacement invalidates ctx after session_shutdown resolves, so reuse
+    // the in-flight startup sweep and let shutdown await it before returning.
+    if (retentionSweep) return retentionSweep;
+    retentionSweep = runRetentionSweep(ctx, reason).finally(() => {
+      retentionSweep = undefined;
+    });
+    return retentionSweep;
   }
 
   async function runRetentionSweep(ctx: ExtensionContext, reason: "startup" | "new-snapshots" | "shutdown") {

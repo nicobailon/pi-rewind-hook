@@ -149,6 +149,7 @@ async function captureSnapshot(repoRoot: string): Promise<string> {
 async function createHarness(options: {
   settings?: Record<string, unknown>;
   failGitSubcommands?: string[];
+  pauseGitSubcommand?: { name: string; occurrence: number };
 } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "rewind-ext-test-"));
   const repoRoot = path.join(root, "repo");
@@ -172,6 +173,12 @@ async function createHarness(options: {
   const statusUpdates: Array<{ key: string; value: string | undefined }> = [];
   const selectCalls: Array<{ title: string; options: string[] }> = [];
   const pendingSelections: string[] = [];
+  const gitSubcommandCounts = new Map<string, number>();
+  let pauseStartedResolve: (() => void) | undefined;
+  const pauseStarted = new Promise<void>((resolve) => {
+    pauseStartedResolve = resolve;
+  });
+  let resumePausedGitCall: (() => void) | undefined;
 
   const currentSession = new SessionManagerStub({
     sessionFile: path.join(sessionsDir, "session-1.jsonl"),
@@ -188,12 +195,21 @@ async function createHarness(options: {
       }
 
       const gitSubcommand = args[0] ?? "";
+      const occurrence = (gitSubcommandCounts.get(gitSubcommand) ?? 0) + 1;
+      gitSubcommandCounts.set(gitSubcommand, occurrence);
       if (options.failGitSubcommands?.includes(gitSubcommand)) {
         return {
           stdout: "",
           stderr: `forced git failure for ${gitSubcommand}`,
           code: 1,
         };
+      }
+      if (options.pauseGitSubcommand?.name === gitSubcommand
+        && options.pauseGitSubcommand.occurrence === occurrence) {
+        pauseStartedResolve?.();
+        await new Promise<void>((resolve) => {
+          resumePausedGitCall = resolve;
+        });
       }
 
       return runGit(repoRoot, args);
@@ -283,6 +299,15 @@ async function createHarness(options: {
       return isAncestor(repoRoot, ancestor, descendant);
     },
     eventHandlers,
+    async waitForPausedGitCall() {
+      assert.ok(options.pauseGitSubcommand, "the harness was not configured to pause git");
+      await pauseStarted;
+    },
+    resumePausedGitCall() {
+      assert.ok(resumePausedGitCall, "no git invocation is paused");
+      resumePausedGitCall();
+      resumePausedGitCall = undefined;
+    },
     async cleanup() {
       if (originalAgentDir === undefined) {
         delete process.env.PI_CODING_AGENT_DIR;
@@ -710,6 +735,54 @@ test("ancestor-only retention discovery ignores unrelated session trees", async 
   }
 });
 
+test("session shutdown waits for an in-flight startup retention sweep", async () => {
+  const harness = await createHarness({
+    settings: { rewind: { retention: { maxSnapshots: 10 } } },
+    // The first check reconstructs the active rewind state; the second is the
+    // detached startup sweep that a session replacement must join.
+    pauseGitSubcommand: { name: "cat-file", occurrence: 2 },
+  });
+  let paused = false;
+
+  try {
+    await harness.writeRepoFile("tracked.txt", "live state\n");
+    const liveCommit = await harness.captureSnapshot();
+    harness.currentSession.replaceEntries([
+      {
+        type: "custom",
+        id: "rewind-op-1",
+        parentId: null,
+        timestamp: new Date().toISOString(),
+        customType: "rewind-op",
+        data: { v: 2, snapshots: [liveCommit], current: 0 },
+      },
+    ]);
+
+    await harness.invoke("session_start", {});
+    await harness.waitForPausedGitCall();
+    paused = true;
+
+    let shutdownComplete = false;
+    const shutdown = harness.invoke("session_shutdown", {});
+    void shutdown.then(() => {
+      shutdownComplete = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(shutdownComplete, false);
+
+    harness.resumePausedGitCall();
+    paused = false;
+    await shutdown;
+    assert.equal(shutdownComplete, true);
+  } finally {
+    if (paused) {
+      harness.resumePausedGitCall();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    await harness.cleanup();
+  }
+});
+
 test("retention rewrites the keepalive ref when a live snapshot exists", async () => {
   const harness = await createHarness({
     settings: { rewind: { retention: { maxSnapshots: 10 } } },
@@ -746,6 +819,58 @@ test("retention rewrites the keepalive ref when a live snapshot exists", async (
     }
     assert.ok(storeHead);
     assert.equal(await harness.isAncestor(liveCommit, storeHead!), true);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("retention retries a ref rewrite that races with a new snapshot", async () => {
+  const harness = await createHarness({
+    settings: { rewind: { retention: { maxSnapshots: 10 } } },
+    pauseGitSubcommand: { name: "update-ref", occurrence: 1 },
+  });
+
+  try {
+    await harness.writeRepoFile("tracked.txt", "stale state\n");
+    const staleCommit = await harness.captureSnapshot();
+    await harness.writeRepoFile("tracked.txt", "live state\n");
+    const liveCommit = await harness.captureSnapshot();
+    await harness.writeRepoFile("tracked.txt", "concurrent state\n");
+    const concurrentCommit = await harness.captureSnapshot();
+    await harness.updateStoreRef(staleCommit);
+
+    harness.currentSession.replaceEntries([
+      {
+        type: "custom",
+        id: "rewind-op-1",
+        parentId: null,
+        timestamp: new Date().toISOString(),
+        customType: "rewind-op",
+        data: { v: 2, snapshots: [liveCommit], current: 0 },
+      },
+    ]);
+
+    await harness.invoke("session_start", {});
+    await harness.waitForPausedGitCall();
+    await harness.updateStoreRef(concurrentCommit);
+    harness.resumePausedGitCall();
+
+    const deadline = Date.now() + 3000;
+    let storeHead: string | undefined;
+    while (Date.now() < deadline) {
+      storeHead = await harness.revParseStore();
+      if (storeHead
+        && await harness.isAncestor(liveCommit, storeHead)
+        && await harness.isAncestor(concurrentCommit, storeHead)) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    assert.ok(storeHead);
+    assert.equal(await harness.isAncestor(liveCommit, storeHead), true);
+    assert.equal(await harness.isAncestor(concurrentCommit, storeHead), true);
+    assert.equal(harness.notifications.some(({ message }) => message.includes("retention startup sweep failed")), false);
   } finally {
     await harness.cleanup();
   }
