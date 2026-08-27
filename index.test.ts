@@ -167,7 +167,7 @@ async function createHarness(options: {
   await runGitChecked(repoRoot, ["config", "user.email", "rewind@example.com"]);
 
   const handlers = new Map<string, EventHandler>();
-  const eventHandlers = new Map<string, (data: unknown) => void>();
+  const eventHandlers = new Map<string, EventHandler>();
   const execCalls: string[][] = [];
   const notifications: Array<{ message: string; level: string }> = [];
   const statusUpdates: Array<{ key: string; value: string | undefined }> = [];
@@ -525,8 +525,9 @@ test("rewind:checkpoint-entry binds the current tree to a custom message", async
     ]);
 
     await harness.invoke("session_start", {});
-    harness.eventHandlers.get("rewind:checkpoint-entry")?.({ source: "pi-custom-compaction", entryId: "marker-1" });
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    const checkpointHandler = harness.eventHandlers.get("rewind:checkpoint-entry");
+    assert.ok(checkpointHandler, "missing rewind:checkpoint-entry handler");
+    await checkpointHandler({ source: "pi-custom-compaction", entryId: "marker-1" });
     await harness.writeRepoFile("notes.txt", "current state\n");
 
     harness.enqueueSelection("Restore files to that point");
