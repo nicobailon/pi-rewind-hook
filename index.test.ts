@@ -146,6 +146,35 @@ async function captureSnapshot(repoRoot: string): Promise<string> {
   return await gitStdout(repoRoot, ["commit-tree", treeSha, "-m", "rewind snapshot test"]);
 }
 
+async function createSubmoduleFixture(repoRoot: string) {
+  const sourceRepo = await mkdtemp(path.join(path.dirname(repoRoot), "rewind-submodule-source-"));
+  await runGitChecked(sourceRepo, ["init"]);
+  await runGitChecked(sourceRepo, ["config", "user.name", "Rewind Test"]);
+  await runGitChecked(sourceRepo, ["config", "user.email", "rewind@example.com"]);
+  await writeFile(path.join(sourceRepo, "file.txt"), "submodule v1\n");
+  await runGitChecked(sourceRepo, ["add", "file.txt"]);
+  await runGitChecked(sourceRepo, ["commit", "-m", "submodule v1"]);
+  const firstCommit = await gitStdout(sourceRepo, ["rev-parse", "HEAD"]);
+  await writeFile(path.join(sourceRepo, "file.txt"), "submodule v2\n");
+  await runGitChecked(sourceRepo, ["add", "file.txt"]);
+  await runGitChecked(sourceRepo, ["commit", "-m", "submodule v2"]);
+  const secondCommit = await gitStdout(sourceRepo, ["rev-parse", "HEAD"]);
+
+  await runGitChecked(repoRoot, ["commit", "--allow-empty", "-m", "before submodule"]);
+  const beforeSubmoduleCommit = await gitStdout(repoRoot, ["rev-parse", "HEAD"]);
+  await runGitChecked(repoRoot, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", sourceRepo, "nested"]);
+  await runGitChecked(repoRoot, ["-C", "nested", "checkout", "--detach", firstCommit]);
+  await runGitChecked(repoRoot, ["add", "nested"]);
+  await runGitChecked(repoRoot, ["commit", "-m", "pin submodule v1"]);
+  const firstSuperCommit = await gitStdout(repoRoot, ["rev-parse", "HEAD"]);
+  await runGitChecked(repoRoot, ["-C", "nested", "checkout", "--detach", secondCommit]);
+  await runGitChecked(repoRoot, ["add", "nested"]);
+  await runGitChecked(repoRoot, ["commit", "-m", "pin submodule v2"]);
+  const secondSuperCommit = await gitStdout(repoRoot, ["rev-parse", "HEAD"]);
+
+  return { beforeSubmoduleCommit, firstCommit, firstSuperCommit, secondSuperCommit };
+}
+
 async function createHarness(options: {
   settings?: Record<string, unknown>;
   failGitSubcommands?: string[];
@@ -872,6 +901,130 @@ test("retention retries a ref rewrite that races with a new snapshot", async () 
     assert.equal(await harness.isAncestor(liveCommit, storeHead), true);
     assert.equal(await harness.isAncestor(concurrentCommit, storeHead), true);
     assert.equal(harness.notifications.some(({ message }) => message.includes("retention startup sweep failed")), false);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("session_before_tree restores a local submodule gitlink commit", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    const fixture = await createSubmoduleFixture(harness.repoRoot);
+    harness.currentSession.replaceEntries([
+      {
+        type: "custom_message",
+        id: "target-entry",
+        parentId: null,
+        timestamp: new Date().toISOString(),
+        customType: "target",
+        content: "target",
+        display: true,
+      },
+      {
+        type: "custom",
+        id: "current-op",
+        parentId: "target-entry",
+        timestamp: new Date().toISOString(),
+        customType: "rewind-op",
+        data: { v: 2, snapshots: [fixture.secondSuperCommit], current: 0 },
+      },
+      {
+        type: "custom",
+        id: "target-op",
+        parentId: "current-op",
+        timestamp: new Date().toISOString(),
+        customType: "rewind-op",
+        data: { v: 2, snapshots: [fixture.firstSuperCommit], bindings: [["target-entry", 0]] },
+      },
+    ]);
+
+    await harness.invoke("session_start", {});
+    harness.enqueueSelection("Restore files to that point");
+    const result = await harness.invoke("session_before_tree", { preparation: { targetId: "target-entry" } });
+
+    assert.equal(result, undefined);
+    assert.equal(await gitStdout(harness.repoRoot, ["-C", "nested", "rev-parse", "HEAD"]), fixture.firstCommit);
+    assert.equal(harness.readRepoFile("nested/file.txt"), "submodule v1\n");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("session_before_tree cancels before removing a submodule", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    const fixture = await createSubmoduleFixture(harness.repoRoot);
+    harness.currentSession.replaceEntries([
+      {
+        type: "custom_message",
+        id: "target-entry",
+        parentId: null,
+        timestamp: new Date().toISOString(),
+        customType: "target",
+        content: "target",
+        display: true,
+      },
+      {
+        type: "custom",
+        id: "current-op",
+        parentId: "target-entry",
+        timestamp: new Date().toISOString(),
+        customType: "rewind-op",
+        data: { v: 2, snapshots: [fixture.secondSuperCommit], current: 0 },
+      },
+      {
+        type: "custom",
+        id: "target-op",
+        parentId: "current-op",
+        timestamp: new Date().toISOString(),
+        customType: "rewind-op",
+        data: { v: 2, snapshots: [fixture.beforeSubmoduleCommit], bindings: [["target-entry", 0]] },
+      },
+    ]);
+
+    await harness.invoke("session_start", {});
+    harness.enqueueSelection("Restore files to that point");
+    const result = await harness.invoke("session_before_tree", { preparation: { targetId: "target-entry" } });
+
+    assert.deepEqual(result, { cancel: true });
+    assert.equal(harness.readRepoFile("nested/file.txt"), "submodule v2\n");
+    assert.ok(harness.notifications.some(({ message }) => message.includes("adding or removing submodules")));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("turn_start warns when a submodule has dirty files", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    await createSubmoduleFixture(harness.repoRoot);
+    await harness.writeRepoFile("nested/file.txt", "dirty nested state\n");
+
+    await harness.invoke("session_start", {});
+    await harness.invoke("turn_start", { turnIndex: 0 });
+
+    assert.ok(harness.notifications.some(({ message }) => message.includes("dirty submodule: nested")));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("turn_start warns when a dirty gitlink has no .gitmodules file", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    await createSubmoduleFixture(harness.repoRoot);
+    await rm(path.join(harness.repoRoot, ".gitmodules"));
+    await harness.writeRepoFile("nested/file.txt", "dirty nested state\n");
+
+    assert.match(await gitStdout(harness.repoRoot, ["ls-files", "--stage", "nested"]), /^160000 /);
+    await harness.invoke("session_start", {});
+    await harness.invoke("turn_start", { turnIndex: 0 });
+
+    assert.ok(harness.notifications.some(({ message }) => message.includes("dirty submodule: nested")));
   } finally {
     await harness.cleanup();
   }

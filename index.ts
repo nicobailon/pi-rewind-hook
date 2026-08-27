@@ -17,6 +17,8 @@ const RETENTION_SWEEP_THRESHOLD = 50;
 const RETENTION_VERSION = 2;
 const EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
+class UnsupportedSubmoduleStateError extends Error {}
+
 type ExecFn = (cmd: string, args: string[]) => Promise<{ stdout: string; stderr: string; code: number }>;
 
 type GitExecResult = Awaited<ReturnType<ExecFn>>;
@@ -68,6 +70,11 @@ interface ActivePromptCollector {
 interface ExactState {
   commitSha: string;
   treeSha: string;
+}
+
+interface GitlinkEntry {
+  path: string;
+  commitSha: string;
 }
 
 interface ActiveBranchState {
@@ -461,6 +468,87 @@ export default function rewindExtension(pi: ExtensionAPI) {
     return repoRoot;
   }
 
+  async function getGitlinkEntries(treeSha: string, gitPrefix: string[] = []): Promise<GitlinkEntry[]> {
+    const result = await execGitChecked([...gitPrefix, "ls-tree", "-r", "-z", treeSha, "--"]);
+    return parseGitlinkEntries(result.stdout);
+  }
+
+  function parseGitlinkEntries(output: string): GitlinkEntry[] {
+    return output.split("\0").flatMap((record) => {
+      const separator = record.indexOf("\t");
+      if (separator < 0) return [];
+
+      const [mode, type, commitSha] = record.slice(0, separator).split(/\s+/);
+      if (mode !== "160000" || type !== "commit" || !commitSha) return [];
+      return [{ path: record.slice(separator + 1), commitSha }];
+    });
+  }
+
+  async function getIndexedGitlinkEntries(): Promise<GitlinkEntry[]> {
+    const result = await execGitChecked(["ls-files", "--stage", "-z"]);
+    return parseGitlinkEntries(result.stdout);
+  }
+
+  async function assertSubmoduleWorktreesClean(root: string, entries: GitlinkEntry[], action: string) {
+    for (const entry of entries) {
+      const submodulePath = resolve(root, entry.path);
+      if (!isInsidePath(submodulePath, root)) {
+        throw new UnsupportedSubmoduleStateError(`refusing ${action} for submodule path outside repo root: ${entry.path}`);
+      }
+
+      const status = await pi.exec("git", ["-C", submodulePath, "status", "--porcelain", "--untracked-files=all"]);
+      if (status.code !== 0) {
+        throw new UnsupportedSubmoduleStateError(`cannot ${action} with uninitialized submodule: ${entry.path}`);
+      }
+      if (status.stdout.trim()) {
+        throw new UnsupportedSubmoduleStateError(`cannot ${action} with dirty submodule: ${entry.path}`);
+      }
+    }
+  }
+
+  async function prepareSubmoduleRestore(root: string, currentEntries: GitlinkEntry[], targetEntries: GitlinkEntry[]) {
+    const currentPaths = new Set(currentEntries.map((entry) => entry.path));
+    const targetPaths = new Set(targetEntries.map((entry) => entry.path));
+    const changedPaths = [...new Set([...currentPaths, ...targetPaths])]
+      .filter((entryPath) => !currentPaths.has(entryPath) || !targetPaths.has(entryPath));
+    if (changedPaths.length > 0) {
+      throw new UnsupportedSubmoduleStateError(
+        `exact rewind does not support adding or removing submodules: ${changedPaths.join(", ")}`,
+      );
+    }
+
+    await assertSubmoduleWorktreesClean(root, currentEntries, "restore exact files");
+
+    const commitsToInspect = new Map<string, GitlinkEntry>();
+    for (const entry of [...currentEntries, ...targetEntries]) {
+      commitsToInspect.set(`${entry.path}\0${entry.commitSha}`, entry);
+    }
+
+    for (const entry of commitsToInspect.values()) {
+      const entryPath = entry.path;
+      const commitSha = entry.commitSha;
+      const submodulePath = resolve(root, entryPath);
+      const commit = await pi.exec("git", ["-C", submodulePath, "cat-file", "-e", `${commitSha}^{commit}`]);
+      if (commit.code !== 0) {
+        throw new UnsupportedSubmoduleStateError(
+          `cannot inspect submodule ${entryPath}: commit ${commitSha.slice(0, 12)} is unavailable locally`,
+        );
+      }
+
+      const targetTreeSha = (await execGitChecked(["-C", submodulePath, "show", "-s", "--format=%T", commitSha])).stdout.trim();
+      const nestedEntries = await getGitlinkEntries(targetTreeSha, ["-C", submodulePath]);
+      if (nestedEntries.length > 0) {
+        throw new UnsupportedSubmoduleStateError(`cannot restore nested submodules: ${entryPath}`);
+      }
+    }
+  }
+
+  async function restoreSubmodules(root: string, entries: GitlinkEntry[]) {
+    for (const entry of entries) {
+      await execGitChecked(["-C", resolve(root, entry.path), "checkout", "--detach", entry.commitSha]);
+    }
+  }
+
   async function captureWorktreeTree(): Promise<{ treeSha: string }> {
     const root = await getRepoRoot(pi.exec);
     const tempDir = await mkdtemp(join(tmpdir(), "pi-rewind-"));
@@ -470,7 +558,12 @@ export default function rewindExtension(pi: ExtensionAPI) {
       const env = { ...process.env, GIT_INDEX_FILE: tempIndex };
       await execAsync("git add -A", { cwd: root, env });
       const { stdout } = await execAsync("git write-tree", { cwd: root, env });
-      return { treeSha: stdout.trim() };
+      const treeSha = stdout.trim();
+      const entriesByPath = new Map<string, GitlinkEntry>();
+      for (const entry of await getIndexedGitlinkEntries()) entriesByPath.set(entry.path, entry);
+      for (const entry of await getGitlinkEntries(treeSha)) entriesByPath.set(entry.path, entry);
+      await assertSubmoduleWorktreesClean(root, [...entriesByPath.values()], "capture exact files");
+      return { treeSha };
     } finally {
       await rm(tempDir, { recursive: true, force: true }).catch(() => {
         // Best effort cleanup for temporary index directory.
@@ -625,6 +718,12 @@ export default function rewindExtension(pi: ExtensionAPI) {
     const { treeSha: currentTreeSha } = await captureWorktreeTree();
     const targetTreeSha = await getCommitTreeSha(targetCommitSha);
 
+    const currentSubmodules = await getGitlinkEntries(currentTreeSha);
+    const targetSubmodules = await getGitlinkEntries(targetTreeSha);
+    if (currentSubmodules.length > 0 || targetSubmodules.length > 0) {
+      await prepareSubmoduleRestore(repoRoot!, currentSubmodules, targetSubmodules);
+    }
+
     if (currentTreeSha === targetTreeSha) {
       lastExact = { commitSha: targetCommitSha, treeSha: targetTreeSha };
       return { changed: false, targetTreeSha };
@@ -634,6 +733,13 @@ export default function rewindExtension(pi: ExtensionAPI) {
     const pathsToDelete = await getDeletedPaths(currentTreeSha, targetTreeSha);
     await deletePathsFromWorkingTree(pathsToDelete);
     await execGitChecked(["restore", `--source=${targetCommitSha}`, "--worktree", "--", "."]);
+    if (targetSubmodules.length > 0) {
+      await restoreSubmodules(repoRoot!, targetSubmodules);
+      const { treeSha: restoredTreeSha } = await captureWorktreeTree();
+      if (restoredTreeSha !== targetTreeSha) {
+        throw new Error(`submodule restore did not produce target tree ${targetTreeSha}`);
+      }
+    }
     lastExact = { commitSha: targetCommitSha, treeSha: targetTreeSha };
     return { changed: true, undoCommitSha, targetTreeSha };
   }
@@ -1146,7 +1252,12 @@ export default function rewindExtension(pi: ExtensionAPI) {
     }
 
     await getRepoRoot(pi.exec);
-    await reconstructState(ctx);
+    try {
+      await reconstructState(ctx);
+    } catch (error) {
+      if (!(error instanceof UnsupportedSubmoduleStateError)) throw error;
+      notify(ctx, `Rewind unavailable: ${error.message}`, "warning");
+    }
     updateStatus(ctx);
     maybeSweepRetention(ctx, "startup").catch((error) => {
       notify(ctx, `Rewind retention startup sweep failed: ${error instanceof Error ? error.message : String(error)}`, "warning");

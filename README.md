@@ -181,6 +181,8 @@ Rewind restores the exact file state for the snapshot domain it owns:
 
 Before restoring target contents, it deletes paths present in the current snapshot but absent from the target snapshot, then restores the target snapshot into the worktree only.
 
+Submodules are supported only when their paths stay unchanged, their worktrees are clean and initialized, and each target commit is already available locally. Rewind checks out those target commits without fetching. Exact restore is refused with a clear error for dirty or unavailable submodule state, added or removed submodule paths, and nested submodules; uncommitted files inside submodules are not part of snapshots.
+
 Out of scope:
 
 - ignored files
@@ -240,6 +242,7 @@ grep '"customType":"rewind-' ~/.pi/agent/sessions/**/*.jsonl
 ## Limitations
 
 - Only works in git repositories
+- Submodule snapshots contain gitlink commits, not uncommitted nested files; unsupported submodule states are refused instead of reported as exact restores
 - Session metadata grows append-only; retention only trims git reachability
 - Discovery for retention is best-effort across discovered Pi session roots and explicit `parentSession` ancestors
 - Ignored files and empty directories are outside the snapshot model

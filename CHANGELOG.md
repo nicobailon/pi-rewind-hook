@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 - Retention now waits for in-flight startup sweeps during session replacement and preserves concurrent keepalive-ref updates. Thanks to [@jesseylin](https://github.com/jesseylin) for #11.
+- Exact rewind now handles clean local submodule commits and refuses unsupported or dirty submodule states instead of silently claiming restore success. Thanks to [@EpochalEngineer](https://github.com/EpochalEngineer) for #10.
 
 ## [1.8.5] - 2026-07-28
 
