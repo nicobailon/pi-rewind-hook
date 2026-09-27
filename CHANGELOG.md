@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- Checkpoints reuse one private snapshot index per session, so `git add -A` only rehashes files whose stat data changed and large repositories checkpoint much faster. The index is rebuilt whenever reuse could record a different tree than a fresh index.
+
 ## [1.8.6] - 2026-08-27
 
 ### Highlights
