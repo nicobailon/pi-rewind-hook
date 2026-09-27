@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rename, rm, utimes, writeFile } from "node:fs/promises";
 import test from "node:test";
 import os from "node:os";
 import path from "node:path";
@@ -197,6 +197,11 @@ async function createHarness(options: {
 
   const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
+  // Snapshot indexes live until session_shutdown, which most tests never send.
+  const tempDir = path.join(root, "tmp");
+  mkdirSync(tempDir);
+  const originalTempEnv = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP };
+  for (const name of Object.keys(originalTempEnv)) process.env[name] = tempDir;
 
   await runGitChecked(repoRoot, ["init"]);
   await runGitChecked(repoRoot, ["config", "user.name", "Rewind Test"]);
@@ -349,6 +354,10 @@ async function createHarness(options: {
         delete process.env.PI_CODING_AGENT_DIR;
       } else {
         process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+      }
+      for (const [name, value] of Object.entries(originalTempEnv)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
       }
       await rm(root, { recursive: true, force: true });
     },
@@ -1091,6 +1100,208 @@ test("session_before_tree restores exact file bytes when core.autocrlf is enable
     assert.equal(harness.readRepoFile("run.sh"), "#!/bin/sh\necho before\n");
     assert.equal(harness.readRepoFile("windows.txt"), "one\r\ntwo\r\n");
     assert.equal(harness.readRepoFile("untouched.sh"), "#!/bin/sh\necho untouched\n");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+type Harness = Awaited<ReturnType<typeof createHarness>>;
+
+async function freshIndexTree(repoRoot: string): Promise<string> {
+  const indexDir = await mkdtemp(path.join(os.tmpdir(), "rewind-fresh-index-"));
+  try {
+    const env = { ...process.env, GIT_INDEX_FILE: path.join(indexDir, "index") };
+    // Checkpoints store exact bytes, so capture with autocrlf off like the extension.
+    await execFileAsync("git", ["-c", "core.autocrlf=false", "add", "-A"], { cwd: repoRoot, env });
+    return (await execFileAsync("git", ["write-tree"], { cwd: repoRoot, env })).stdout.trim();
+  } finally {
+    await rm(indexDir, { recursive: true, force: true });
+  }
+}
+
+async function renameViaTemp(from: string, to: string): Promise<void> {
+  // Two steps so case-only renames also apply on case-insensitive filesystems.
+  await rename(from, `${from}.tmp`);
+  await rename(`${from}.tmp`, to);
+}
+
+function markerEntry(id: string): RewindEntry {
+  return {
+    type: "custom_message",
+    id,
+    parentId: null,
+    timestamp: new Date().toISOString(),
+    customType: "pi-custom-compaction.virtual-summary-marker",
+    content: "Older context was summarized in the background.",
+    display: true,
+  };
+}
+
+async function checkpointTree(harness: Harness, entryId: string): Promise<string> {
+  const checkpointHandler = harness.eventHandlers.get("rewind:checkpoint-entry");
+  assert.ok(checkpointHandler, "missing rewind:checkpoint-entry handler");
+  await checkpointHandler({ source: "pi-custom-compaction", entryId });
+
+  for (const entry of harness.currentSession.getEntries()) {
+    if (entry.type !== "custom" || entry.customType !== "rewind-op") continue;
+    const data = entry.data as { snapshots: string[]; bindings?: [string, number][] };
+    const binding = data.bindings?.find(([boundId]) => boundId === entryId);
+    if (binding) return await gitStdout(harness.repoRoot, ["rev-parse", `${data.snapshots[binding[1]]}^{tree}`]);
+  }
+  assert.fail(`no checkpoint bound to ${entryId}`);
+}
+
+async function assertCheckpointsMatchFreshIndex(harness: Harness, steps: Array<[string, () => Promise<unknown>]>) {
+  harness.currentSession.replaceEntries(steps.map((_, index) => markerEntry(`marker-${index}`)));
+  await harness.invoke("session_start", {});
+  for (const [index, [label, change]] of steps.entries()) {
+    await change();
+    assert.equal(await checkpointTree(harness, `marker-${index}`), await freshIndexTree(harness.repoRoot), label);
+  }
+}
+
+test("checkpoints match a fresh index across edits, ignores and case-only renames", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+  const repoPath = (relativePath: string) => path.join(harness.repoRoot, relativePath);
+
+  try {
+    await assertCheckpointsMatchFreshIndex(harness, [
+      ["initial files", async () => {
+        await harness.writeRepoFile("a.txt", "aaaa\n");
+        await harness.writeRepoFile("gone.txt", "gone\n");
+        await harness.writeRepoFile("dir/b.txt", "b\n");
+      }],
+      // Same size and written right after the previous capture.
+      ["same-size edit", () => harness.writeRepoFile("a.txt", "bbbb\n")],
+      ["add and delete", async () => {
+        await harness.writeRepoFile("new/c.txt", "c\n");
+        await rm(repoPath("gone.txt"));
+      }],
+      // dir/b.txt stays in a reused index, while a fresh index skips it.
+      ["newly ignored file", () => harness.writeRepoFile(".gitignore", "dir/\n")],
+      ["case-only file rename", () => renameViaTemp(repoPath("a.txt"), repoPath("A.txt"))],
+      ["case-only directory rename", () => renameViaTemp(repoPath("new"), repoPath("New"))],
+    ]);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("checkpoints re-apply changed attributes and line-ending config", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+  const externalAttributes = path.join(path.dirname(harness.repoRoot), "attributes");
+
+  try {
+    await runGitChecked(harness.repoRoot, ["config", "core.autocrlf", "false"]);
+    await harness.writeRepoFile("notes.txt", "one\r\ntwo\r\n");
+    await harness.writeRepoFile("readme.md", "three\r\nfour\r\n");
+    // Old mtimes keep git from rehashing these files as racily clean.
+    const past = new Date(Date.now() - 60_000);
+    await utimes(path.join(harness.repoRoot, "notes.txt"), past, past);
+    await utimes(path.join(harness.repoRoot, "readme.md"), past, past);
+
+    await assertCheckpointsMatchFreshIndex(harness, [
+      ["CRLF files", async () => undefined],
+      ["core.attributesFile set", () => runGitChecked(harness.repoRoot, ["config", "core.attributesFile", externalAttributes])],
+      ["core.attributesFile edited", () => writeFile(externalAttributes, "*.md text eol=lf\n")],
+      ["in-repo .gitattributes", () => harness.writeRepoFile(".gitattributes", "*.txt text eol=lf\n")],
+      ["core.autocrlf", () => runGitChecked(harness.repoRoot, ["config", "core.autocrlf", "true"])],
+    ]);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("concurrent checkpoints take turns on the snapshot index", async () => {
+  const harness = await createHarness({
+    settings: { rewind: { silentCheckpoints: true } },
+    // Pauses the first capture after it has written its tree.
+    pauseGitSubcommand: { name: "ls-tree", occurrence: 1 },
+  });
+  const captures: Promise<string>[] = [];
+  let paused = false;
+
+  try {
+    await harness.writeRepoFile("notes.txt", "state\n");
+    harness.currentSession.replaceEntries([markerEntry("marker-a"), markerEntry("marker-b")]);
+    await harness.invoke("session_start", {});
+
+    captures.push(checkpointTree(harness, "marker-a"));
+    await harness.waitForPausedGitCall();
+    paused = true;
+    const gitCallsBeforeSecond = harness.execCalls.length;
+    captures.push(checkpointTree(harness, "marker-b"));
+    // Long enough for an unqueued capture to reach git.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(harness.execCalls.length, gitCallsBeforeSecond, "the second capture ran git during the first");
+
+    harness.resumePausedGitCall();
+    paused = false;
+    const expected = await freshIndexTree(harness.repoRoot);
+    assert.deepEqual(await Promise.all(captures), [expected, expected]);
+  } finally {
+    if (paused) harness.resumePausedGitCall();
+    await Promise.allSettled(captures);
+    await harness.cleanup();
+  }
+});
+
+test("session_before_fork after resume reuses the exact commit only while files are unchanged", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+  const snapshotCount = async () => (await gitStdout(harness.repoRoot, ["log", "--format=%s", STORE_REF]))
+    .split("\n")
+    .filter((subject) => subject === "pi rewind snapshot").length;
+  const forkPendingCommit = () => {
+    const pending = harness.currentSession.getEntries().filter((entry) => entry.type === "custom" && entry.customType === "rewind-fork-pending").at(-1);
+    return (pending?.data as { current?: string } | undefined)?.current;
+  };
+
+  try {
+    const timestamp = Date.now();
+    const assistantMessage = { role: "assistant", timestamp, content: [{ type: "text", text: "Edited the notes" }] };
+    harness.currentSession.replaceEntries([
+      {
+        type: "message",
+        id: "user-1",
+        parentId: null,
+        timestamp: new Date(timestamp - 1000).toISOString(),
+        message: { role: "user", content: [{ type: "text", text: "Edit the notes" }] },
+      },
+      {
+        type: "message",
+        id: "assistant-1",
+        parentId: "user-1",
+        timestamp: new Date(timestamp).toISOString(),
+        message: assistantMessage,
+      },
+    ]);
+    await harness.writeRepoFile("notes.txt", "aaaa\n");
+
+    await harness.invoke("session_start", {});
+    await harness.invoke("before_agent_start", { prompt: "Edit the notes" });
+    await harness.invoke("turn_start", { turnIndex: 0 });
+    await harness.writeRepoFile("notes.txt", "bbbb\n");
+    await harness.invoke("turn_end", { message: assistantMessage });
+    await harness.invoke("agent_end", {});
+    const turn = harness.currentSession.getEntries().find((entry) => entry.type === "custom" && entry.customType === "rewind-turn");
+    const turnCommit = (turn?.data as { snapshots: string[] } | undefined)?.snapshots.at(-1);
+    assert.ok(turnCommit, "the turn recorded no snapshot");
+
+    await harness.invoke("session_start", { reason: "resume" });
+    const snapshotsAfterResume = await snapshotCount();
+
+    harness.enqueueSelection("Conversation only (keep current files)");
+    assert.equal(await harness.invoke("session_before_fork", { entryId: "user-1" }), undefined);
+    assert.equal(forkPendingCommit(), turnCommit);
+    assert.equal(await snapshotCount(), snapshotsAfterResume, "no duplicate snapshot commit");
+
+    // Same size and written right after the previous capture.
+    await harness.writeRepoFile("notes.txt", "cccc\n");
+    harness.enqueueSelection("Conversation only (keep current files)");
+    assert.equal(await harness.invoke("session_before_fork", { entryId: "user-1" }), undefined);
+    const liveCommit = forkPendingCommit();
+    assert.notEqual(liveCommit, turnCommit);
+    assert.equal(await gitStdout(harness.repoRoot, ["rev-parse", `${liveCommit}^{tree}`]), await freshIndexTree(harness.repoRoot));
   } finally {
     await harness.cleanup();
   }

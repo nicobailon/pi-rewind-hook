@@ -2,7 +2,7 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil
 import { exec as execCb } from "child_process";
 import { existsSync, readFileSync, realpathSync } from "fs";
 import { mkdtemp, readdir, readFile, rm, stat } from "fs/promises";
-import { tmpdir } from "os";
+import { homedir, tmpdir } from "os";
 import { dirname, isAbsolute, join, relative, resolve } from "path";
 import { promisify } from "util";
 
@@ -16,6 +16,8 @@ const LEGACY_ZERO_SHA = "0000000000000000000000000000000000000000";
 const RETENTION_SWEEP_THRESHOLD = 50;
 const RETENTION_VERSION = 2;
 const EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+const SNAPSHOT_CONFIG_PATTERN = "^(core\\.(autocrlf|eol|safecrlf|attributesfile|filemode|symlinks|ignorecase|precomposeunicode)|filter\\.)";
+const LIST_MAX_BUFFER = 512 * 1024 * 1024;
 
 class UnsupportedSubmoduleStateError extends Error {}
 
@@ -75,6 +77,19 @@ interface ExactState {
 interface GitlinkEntry {
   path: string;
   commitSha: string;
+}
+
+interface SnapshotIndex {
+  root: string;
+  dir: string;
+  ignoreCase?: boolean;
+  externalAttributeFiles?: string[];
+  conversionInputs?: string;
+}
+
+interface SnapshotIndexListing {
+  paths: string[];
+  conversionInputs: string;
 }
 
 interface ActiveBranchState {
@@ -398,6 +413,8 @@ export default function rewindExtension(pi: ExtensionAPI) {
   let sweepCompletedThisSession = false;
   let forceConversationOnlyOnNextFork = false;
   let forceConversationOnlySource: string | null = null;
+  let snapshotIndex: SnapshotIndex | null = null;
+  let captureQueue: Promise<unknown> = Promise.resolve();
 
   function notify(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error" = "info") {
     if (!ctx.hasUI) return;
@@ -549,15 +566,144 @@ export default function rewindExtension(pi: ExtensionAPI) {
     }
   }
 
-  async function captureWorktreeTree(): Promise<{ treeSha: string }> {
+  function enqueueCapture<T>(task: () => Promise<T>): Promise<T> {
+    // Captures share one index file; git fails on index.lock if two overlap.
+    const run = captureQueue.then(task);
+    captureQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  async function disposeSnapshotIndex() {
+    const current = snapshotIndex;
+    snapshotIndex = null;
+    if (!current) return;
+    await rm(current.dir, { recursive: true, force: true }).catch(() => {
+      // Best effort cleanup for snapshot index directory.
+    });
+  }
+
+  function releaseSnapshotIndex(): Promise<void> {
+    return enqueueCapture(disposeSnapshotIndex);
+  }
+
+  async function getSnapshotIndexEnv(root: string): Promise<NodeJS.ProcessEnv> {
+    if (snapshotIndex?.root !== root) {
+      await disposeSnapshotIndex();
+      snapshotIndex = { root, dir: await mkdtemp(join(tmpdir(), "pi-rewind-")) };
+    }
+    return { ...process.env, GIT_INDEX_FILE: join(snapshotIndex.dir, "index") };
+  }
+
+  async function inspectSnapshotIndex(root: string, env: NodeJS.ProcessEnv): Promise<SnapshotIndexListing> {
+    const { stdout } = await execAsync("git ls-files --stage -z", { cwd: root, env, maxBuffer: LIST_MAX_BUFFER });
+    const paths: string[] = [];
+    const attributeEntries: string[] = [];
+    for (const record of stdout.split("\0")) {
+      const separator = record.indexOf("\t");
+      if (separator < 0) continue;
+      const path = record.slice(separator + 1);
+      paths.push(path);
+      if (path === ".gitattributes" || path.endsWith("/.gitattributes")) attributeEntries.push(record);
+    }
+
+    // Attributes and conversion config also decide what git add stores.
+    const config = await pi.exec("git", ["config", "-z", "--get-regexp", SNAPSHOT_CONFIG_PATTERN]);
+    // Exit code 1 only means that no key matched.
+    if (config.code > 1) throw new Error(config.stderr.trim() || `git config failed with code ${config.code}`);
+    const externalAttributes: string[] = [];
+    for (const file of await getExternalAttributeFiles(root)) {
+      externalAttributes.push(file, await readFile(file, "utf8").catch(() => ""));
+    }
+    return { paths, conversionInputs: [...attributeEntries, config.stdout, ...externalAttributes].join("\0") };
+  }
+
+  async function getExternalAttributeFiles(root: string): Promise<string[]> {
+    // Their paths change only with fingerprinted config, so look them up once.
+    if (snapshotIndex?.externalAttributeFiles) return snapshotIndex.externalAttributeFiles;
+
+    const infoAttributes = (await execGitChecked(["-C", root, "rev-parse", "--git-path", "info/attributes"])).stdout.trim();
+    const files = [resolve(root, infoAttributes)];
+    const globalAttributes = await pi.exec("git", ["config", "--path", "core.attributesFile"]);
+    if (globalAttributes.code === 0) {
+      files.push(resolve(root, globalAttributes.stdout.trim()));
+    } else {
+      const configHome = process.env.XDG_CONFIG_HOME || join(process.env.HOME || homedir(), ".config");
+      files.push(join(configHome, "git", "attributes"));
+    }
+    // Only git 2.42+ can report the system-wide file.
+    const systemAttributes = await pi.exec("git", ["var", "GIT_ATTR_SYSTEM"]);
+    if (systemAttributes.code === 0 && systemAttributes.stdout.trim()) files.push(systemAttributes.stdout.trim());
+
+    if (snapshotIndex) snapshotIndex.externalAttributeFiles = files;
+    return files;
+  }
+
+  async function reusedIndexIsStale(root: string, env: NodeJS.ProcessEnv, listing: SnapshotIndexListing): Promise<boolean> {
+    // git reapplies eol and filter conversion only to files it rehashes.
+    if (listing.conversionInputs !== snapshotIndex?.conversionInputs) return true;
+
+    // Files that became ignored stay tracked in a reused index.
+    const { stdout: ignored } = await execAsync("git ls-files -z --cached --ignored --exclude-standard", {
+      cwd: root,
+      env,
+      maxBuffer: LIST_MAX_BUFFER,
+    });
+    if (ignored) return true;
+
+    // On case-insensitive filesystems, a case-only rename keeps the old name.
+    return await hasCaseOnlyRenames(root, listing.paths);
+  }
+
+  async function hasCaseOnlyRenames(root: string, indexedPaths: string[]): Promise<boolean> {
+    if (snapshotIndex && snapshotIndex.ignoreCase === undefined) {
+      const result = await pi.exec("git", ["config", "--bool", "core.ignorecase"]);
+      snapshotIndex.ignoreCase = result.stdout.trim() === "true";
+    }
+    if (!snapshotIndex?.ignoreCase) return false;
+
+    const indexedNamesByDir = new Map<string, Set<string>>();
+    for (const path of indexedPaths) {
+      let dir = "";
+      for (const name of path.split("/")) {
+        const names = indexedNamesByDir.get(dir) ?? new Set<string>();
+        names.add(name);
+        indexedNamesByDir.set(dir, names);
+        dir = dir ? `${dir}/${name}` : name;
+      }
+    }
+
+    for (const [dir, names] of indexedNamesByDir) {
+      const namesOnDisk = new Set(await readdir(join(root, dir)).catch(() => [] as string[]));
+      for (const name of names) {
+        if (!namesOnDisk.has(name)) return true;
+      }
+    }
+    return false;
+  }
+
+  function captureWorktreeTree(): Promise<{ treeSha: string }> {
+    return enqueueCapture(captureWorktreeTreeNow);
+  }
+
+  async function captureWorktreeTreeNow(): Promise<{ treeSha: string }> {
     const root = await getRepoRoot(pi.exec);
-    const tempDir = await mkdtemp(join(tmpdir(), "pi-rewind-"));
-    const tempIndex = join(tempDir, "index");
 
     try {
-      const env = { ...process.env, GIT_INDEX_FILE: tempIndex };
+      // Reusing the index lets git rehash only files whose stat data changed.
+      const reused = snapshotIndex?.root === root;
+      let env = await getSnapshotIndexEnv(root);
       // Git for Windows' default autocrlf=true would restore LF files as CRLF.
       await execAsync("git -c core.autocrlf=false add -A", { cwd: root, env });
+      let listing = await inspectSnapshotIndex(root, env);
+      // Start over whenever reuse could differ from a fresh index.
+      if (reused && (await reusedIndexIsStale(root, env, listing))) {
+        await disposeSnapshotIndex();
+        env = await getSnapshotIndexEnv(root);
+        await execAsync("git -c core.autocrlf=false add -A", { cwd: root, env });
+        listing = await inspectSnapshotIndex(root, env);
+      }
+      snapshotIndex!.conversionInputs = listing.conversionInputs;
+
       const { stdout } = await execAsync("git write-tree", { cwd: root, env });
       const treeSha = stdout.trim();
       const entriesByPath = new Map<string, GitlinkEntry>();
@@ -565,10 +711,10 @@ export default function rewindExtension(pi: ExtensionAPI) {
       for (const entry of await getGitlinkEntries(treeSha)) entriesByPath.set(entry.path, entry);
       await assertSubmoduleWorktreesClean(root, [...entriesByPath.values()], "capture exact files");
       return { treeSha };
-    } finally {
-      await rm(tempDir, { recursive: true, force: true }).catch(() => {
-        // Best effort cleanup for temporary index directory.
-      });
+    } catch (error) {
+      // A failed capture must not seed the next one.
+      await disposeSnapshotIndex();
+      throw error;
     }
   }
 
@@ -1236,6 +1382,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
 
   async function initializeForSession(ctx: ExtensionContext) {
     activeContext = ctx;
+    await releaseSnapshotIndex();
     resetState();
     syncSessionIdentity(ctx);
 
@@ -1365,8 +1512,11 @@ export default function rewindExtension(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async (_event, ctx) => {
     syncSessionIdentity(ctx);
-    if (!isGitRepo) return;
-    await maybeSweepRetention(ctx, "shutdown");
+    try {
+      if (isGitRepo) await maybeSweepRetention(ctx, "shutdown");
+    } finally {
+      await releaseSnapshotIndex();
+    }
   });
 
   pi.on("turn_start", async (event, ctx) => {

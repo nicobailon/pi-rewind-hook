@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- Checkpoints reuse one private snapshot index per session, so `git add -A` only rehashes files whose stat data changed and large repositories checkpoint much faster. The index is rebuilt whenever reuse could record a different tree than a fresh index.
+
 ### Fixed
 - File restores keep exact line endings when `core.autocrlf` is enabled, the Git for Windows default, instead of rewriting LF files as CRLF. Thanks to [@wyruweso](https://github.com/wyruweso) for #15.
 
