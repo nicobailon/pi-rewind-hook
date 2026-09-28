@@ -754,12 +754,13 @@ export default function rewindExtension(pi: ExtensionAPI) {
       // git add -A drops deleted files.
       if (!current) return false;
       seen.set(entry.path, current.ctimeNs);
-      // git already rehashes a file whose size or whole-second mtime changed.
-      if (current.size !== BigInt(entry.size) || current.mtimeMs / 1000n !== BigInt(entry.mtimeSec)) return false;
+      // git already rehashes a file whose size or whole-second mtime changed; the index keeps
+      // only the low 32 bits of the size.
+      if (BigInt.asUintN(32, current.size) !== BigInt(entry.size) || current.mtimeMs / 1000n !== BigInt(entry.mtimeSec)) return false;
       // A window alone misses writes after the clock is set back, so also compare with the
-      // change time seen last time, which alone misses files not seen yet and same-tick writes.
+      // change time seen last time, which alone misses same-tick writes. Without one, rehash.
       const previous = changeTimes?.get(entry.path);
-      return current.ctimeNs >= since || (previous !== undefined && current.ctimeNs !== previous);
+      return previous === undefined || current.ctimeNs >= since || current.ctimeNs !== previous;
     });
     await forgetStatData(root, env, missed);
     return seen;
