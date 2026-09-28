@@ -1212,36 +1212,29 @@ test("checkpoints re-apply changed attributes and line-ending config", async () 
   }
 });
 
-test("concurrent checkpoints take turns on the snapshot index", async () => {
-  const harness = await createHarness({
-    settings: { rewind: { silentCheckpoints: true } },
-    // Pauses the first capture after it has written its tree.
-    pauseGitSubcommand: { name: "ls-tree", occurrence: 1 },
-  });
-  const captures: Promise<string>[] = [];
-  let paused = false;
+test("checkpoints see same-size rewrites that restore mtime under weakened stat config", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+  const notes = path.join(harness.repoRoot, "notes.txt");
+  const past = new Date(Date.now() - 60_000);
+  const rewriteKeepingStat = async (content: string) => {
+    await writeFile(notes, content);
+    await utimes(notes, past, past);
+  };
 
   try {
-    await harness.writeRepoFile("notes.txt", "state\n");
-    harness.currentSession.replaceEntries([markerEntry("marker-a"), markerEntry("marker-b")]);
-    await harness.invoke("session_start", {});
+    // Each setting alone lets a reused index keep stale content for such a rewrite.
+    await runGitChecked(harness.repoRoot, ["config", "core.trustctime", "false"]);
+    await runGitChecked(harness.repoRoot, ["config", "core.checkStat", "minimal"]);
+    await runGitChecked(harness.repoRoot, ["config", "core.ignoreStat", "true"]);
 
-    captures.push(checkpointTree(harness, "marker-a"));
-    await harness.waitForPausedGitCall();
-    paused = true;
-    const gitCallsBeforeSecond = harness.execCalls.length;
-    captures.push(checkpointTree(harness, "marker-b"));
-    // Long enough for an unqueued capture to reach git.
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    assert.equal(harness.execCalls.length, gitCallsBeforeSecond, "the second capture ran git during the first");
-
-    harness.resumePausedGitCall();
-    paused = false;
-    const expected = await freshIndexTree(harness.repoRoot);
-    assert.deepEqual(await Promise.all(captures), [expected, expected]);
+    await assertCheckpointsMatchFreshIndex(harness, [
+      ["initial file", () => rewriteKeepingStat("aaaa\n")],
+      ["rewrite in the same second as the capture", () => rewriteKeepingStat("bbbb\n")],
+      // Lets the next capture record stat data it can trust.
+      ["unchanged in a later second", () => new Promise((resolve) => setTimeout(resolve, 1020 - (Date.now() % 1000)))],
+      ["rewrite in a later second", () => rewriteKeepingStat("cccc\n")],
+    ]);
   } finally {
-    if (paused) harness.resumePausedGitCall();
-    await Promise.allSettled(captures);
     await harness.cleanup();
   }
 });

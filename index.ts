@@ -17,6 +17,10 @@ const RETENTION_SWEEP_THRESHOLD = 50;
 const RETENTION_VERSION = 2;
 const EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const SNAPSHOT_CONFIG_PATTERN = "^(core\\.(autocrlf|eol|safecrlf|attributesfile|filemode|symlinks|ignorecase|precomposeunicode)|filter\\.)";
+// A reused index is exact only if git's stat check sees every write, so force its
+// strictest form and turn off fsmonitor, which skips it. None of these change what git stores.
+const SNAPSHOT_GIT =
+  "git -c core.trustctime=true -c core.checkStat=default -c core.ignoreStat=false -c core.fsmonitor=false";
 const LIST_MAX_BUFFER = 512 * 1024 * 1024;
 
 class UnsupportedSubmoduleStateError extends Error {}
@@ -88,7 +92,7 @@ interface SnapshotIndex {
 }
 
 interface SnapshotIndexListing {
-  paths: string[];
+  entries: Array<{ record: string; path: string; ctimeSec: number }>;
   conversionInputs: string;
 }
 
@@ -595,14 +599,22 @@ export default function rewindExtension(pi: ExtensionAPI) {
   }
 
   async function inspectSnapshotIndex(root: string, env: NodeJS.ProcessEnv): Promise<SnapshotIndexListing> {
-    const { stdout } = await execAsync("git ls-files --stage -z", { cwd: root, env, maxBuffer: LIST_MAX_BUFFER });
-    const paths: string[] = [];
+    // latin1 round-trips path bytes exactly; --debug adds each entry's stat data after it.
+    const { stdout } = await execAsync(`${SNAPSHOT_GIT} ls-files --stage --debug -z`, {
+      cwd: root,
+      env,
+      encoding: "latin1",
+      maxBuffer: LIST_MAX_BUFFER,
+    });
+    const entries: SnapshotIndexListing["entries"] = [];
     const attributeEntries: string[] = [];
-    for (const record of stdout.split("\0")) {
-      const separator = record.indexOf("\t");
-      if (separator < 0) continue;
-      const path = record.slice(separator + 1);
-      paths.push(path);
+    const entryPattern = /([^\0]*)\0 {2}ctime: (\d+):\d+\n(?:.*\n){4}/y;
+    while (entryPattern.lastIndex < stdout.length) {
+      const match = entryPattern.exec(stdout);
+      if (!match) throw new Error("Unexpected git ls-files --debug output");
+      const [, record, ctimeSec] = match;
+      const path = Buffer.from(record.slice(record.indexOf("\t") + 1), "latin1").toString("utf8");
+      entries.push({ record, path, ctimeSec: Number(ctimeSec) });
       if (path === ".gitattributes" || path.endsWith("/.gitattributes")) attributeEntries.push(record);
     }
 
@@ -614,7 +626,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
     for (const file of await getExternalAttributeFiles(root)) {
       externalAttributes.push(file, await readFile(file, "utf8").catch(() => ""));
     }
-    return { paths, conversionInputs: [...attributeEntries, config.stdout, ...externalAttributes].join("\0") };
+    return { entries, conversionInputs: [...attributeEntries, config.stdout, ...externalAttributes].join("\0") };
   }
 
   async function getExternalAttributeFiles(root: string): Promise<string[]> {
@@ -643,7 +655,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
     if (listing.conversionInputs !== snapshotIndex?.conversionInputs) return true;
 
     // Files that became ignored stay tracked in a reused index.
-    const { stdout: ignored } = await execAsync("git ls-files -z --cached --ignored --exclude-standard", {
+    const { stdout: ignored } = await execAsync(`${SNAPSHOT_GIT} ls-files -z --cached --ignored --exclude-standard`, {
       cwd: root,
       env,
       maxBuffer: LIST_MAX_BUFFER,
@@ -651,10 +663,10 @@ export default function rewindExtension(pi: ExtensionAPI) {
     if (ignored) return true;
 
     // On case-insensitive filesystems, a case-only rename keeps the old name.
-    return await hasCaseOnlyRenames(root, listing.paths);
+    return hasCaseOnlyRenames(root, listing.entries);
   }
 
-  async function hasCaseOnlyRenames(root: string, indexedPaths: string[]): Promise<boolean> {
+  async function hasCaseOnlyRenames(root: string, indexedEntries: SnapshotIndexListing["entries"]): Promise<boolean> {
     if (snapshotIndex && snapshotIndex.ignoreCase === undefined) {
       const result = await pi.exec("git", ["config", "--bool", "core.ignorecase"]);
       snapshotIndex.ignoreCase = result.stdout.trim() === "true";
@@ -662,7 +674,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
     if (!snapshotIndex?.ignoreCase) return false;
 
     const indexedNamesByDir = new Map<string, Set<string>>();
-    for (const path of indexedPaths) {
+    for (const { path } of indexedEntries) {
       let dir = "";
       for (const name of path.split("/")) {
         const names = indexedNamesByDir.get(dir) ?? new Set<string>();
@@ -681,6 +693,17 @@ export default function rewindExtension(pi: ExtensionAPI) {
     return false;
   }
 
+  async function forgetRacyStatData(root: string, env: NodeJS.ProcessEnv, listing: SnapshotIndexListing, startedSec: number) {
+    // git compares whole-second ctimes, so a same-size write in the second a file was
+    // hashed, with its mtime restored, looks unchanged. Any later write lands in a later second.
+    const racy = listing.entries.filter((entry) => entry.ctimeSec >= startedSec);
+    if (racy.length === 0) return;
+    // Re-staging an entry without stat data makes the next git add rehash it.
+    const update = execAsync(`${SNAPSHOT_GIT} update-index -z --index-info`, { cwd: root, env });
+    update.child.stdin?.end(racy.map((entry) => `${entry.record}\0`).join(""), "latin1");
+    await update;
+  }
+
   function captureWorktreeTree(): Promise<{ treeSha: string }> {
     return enqueueCapture(captureWorktreeTreeNow);
   }
@@ -689,23 +712,27 @@ export default function rewindExtension(pi: ExtensionAPI) {
     const root = await getRepoRoot(pi.exec);
 
     try {
+      // Windows reports creation time as ctime, so its stat check can miss a rewrite.
+      if (process.platform === "win32") await disposeSnapshotIndex();
       // Reusing the index lets git rehash only files whose stat data changed.
       const reused = snapshotIndex?.root === root;
+      const startedSec = Math.floor(Date.now() / 1000);
       let env = await getSnapshotIndexEnv(root);
       // Git for Windows' default autocrlf=true would restore LF files as CRLF.
-      await execAsync("git -c core.autocrlf=false add -A", { cwd: root, env });
+      await execAsync(`${SNAPSHOT_GIT} -c core.autocrlf=false add -A`, { cwd: root, env });
       let listing = await inspectSnapshotIndex(root, env);
       // Start over whenever reuse could differ from a fresh index.
       if (reused && (await reusedIndexIsStale(root, env, listing))) {
         await disposeSnapshotIndex();
         env = await getSnapshotIndexEnv(root);
-        await execAsync("git -c core.autocrlf=false add -A", { cwd: root, env });
+        await execAsync(`${SNAPSHOT_GIT} -c core.autocrlf=false add -A`, { cwd: root, env });
         listing = await inspectSnapshotIndex(root, env);
       }
       snapshotIndex!.conversionInputs = listing.conversionInputs;
 
-      const { stdout } = await execAsync("git write-tree", { cwd: root, env });
+      const { stdout } = await execAsync(`${SNAPSHOT_GIT} write-tree`, { cwd: root, env });
       const treeSha = stdout.trim();
+      await forgetRacyStatData(root, env, listing, startedSec);
       const entriesByPath = new Map<string, GitlinkEntry>();
       for (const entry of await getIndexedGitlinkEntries()) entriesByPath.set(entry.path, entry);
       for (const entry of await getGitlinkEntries(treeSha)) entriesByPath.set(entry.path, entry);
