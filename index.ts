@@ -556,7 +556,8 @@ export default function rewindExtension(pi: ExtensionAPI) {
 
     try {
       const env = { ...process.env, GIT_INDEX_FILE: tempIndex };
-      await execAsync("git add -A", { cwd: root, env });
+      // Git for Windows' default autocrlf=true would restore LF files as CRLF.
+      await execAsync("git -c core.autocrlf=false add -A", { cwd: root, env });
       const { stdout } = await execAsync("git write-tree", { cwd: root, env });
       const treeSha = stdout.trim();
       const entriesByPath = new Map<string, GitlinkEntry>();
@@ -732,7 +733,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
     const undoCommitSha = await ensureSnapshotForTree(currentTreeSha);
     const pathsToDelete = await getDeletedPaths(currentTreeSha, targetTreeSha);
     await deletePathsFromWorkingTree(pathsToDelete);
-    await execGitChecked(["restore", `--source=${targetCommitSha}`, "--worktree", "--", "."]);
+    await execGitChecked(["-c", "core.autocrlf=false", "restore", `--source=${targetCommitSha}`, "--worktree", "--", "."]);
     if (targetSubmodules.length > 0) {
       await restoreSubmodules(repoRoot!, targetSubmodules);
       const { treeSha: restoredTreeSha } = await captureWorktreeTree();

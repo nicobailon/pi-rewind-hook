@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- File restores keep exact line endings when `core.autocrlf` is enabled, the Git for Windows default, instead of rewriting LF files as CRLF. Thanks to [@wyruweso](https://github.com/wyruweso) for #15.
+
 ## [1.8.6] - 2026-08-27
 
 ### Highlights

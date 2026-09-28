@@ -111,6 +111,13 @@ async function runGit(repoRoot: string, args: string[]): Promise<{ stdout: strin
   }
 }
 
+function gitSubcommandOf(args: string[]): string {
+  // Skip global -c key=value options that precede the subcommand.
+  let index = 0;
+  while (args[index] === "-c") index += 2;
+  return args[index] ?? "";
+}
+
 async function runGitChecked(repoRoot: string, args: string[]): Promise<{ stdout: string; stderr: string; code: number }> {
   const result = await runGit(repoRoot, args);
   if (result.code !== 0) {
@@ -223,7 +230,7 @@ async function createHarness(options: {
         throw new Error(`Unsupported command in test harness: ${cmd}`);
       }
 
-      const gitSubcommand = args[0] ?? "";
+      const gitSubcommand = gitSubcommandOf(args);
       const occurrence = (gitSubcommandCounts.get(gitSubcommand) ?? 0) + 1;
       gitSubcommandCounts.set(gitSubcommand, occurrence);
       if (options.failGitSubcommands?.includes(gitSubcommand)) {
@@ -1025,6 +1032,65 @@ test("turn_start warns when a dirty gitlink has no .gitmodules file", async () =
     await harness.invoke("turn_start", { turnIndex: 0 });
 
     assert.ok(harness.notifications.some(({ message }) => message.includes("dirty submodule: nested")));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("session_before_tree restores exact file bytes when core.autocrlf is enabled", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    // Git for Windows defaults to core.autocrlf=true; set it on the repo so
+    // this runs on every OS.
+    await runGitChecked(harness.repoRoot, ["config", "core.autocrlf", "true"]);
+    await harness.writeRepoFile("run.sh", "#!/bin/sh\necho before\n");
+    await harness.writeRepoFile("windows.txt", "one\r\ntwo\r\n");
+    await harness.writeRepoFile("untouched.sh", "#!/bin/sh\necho untouched\n");
+
+    const assistantTimestamp = Date.now();
+    harness.currentSession.replaceEntries([
+      {
+        type: "message",
+        id: "user-1",
+        parentId: null,
+        timestamp: new Date(assistantTimestamp - 1000).toISOString(),
+        message: { role: "user", content: [{ type: "text", text: "Edit the scripts" }] },
+      },
+      {
+        type: "message",
+        id: "assistant-1",
+        parentId: "user-1",
+        timestamp: new Date(assistantTimestamp).toISOString(),
+        message: {
+          role: "assistant",
+          timestamp: assistantTimestamp,
+          content: [{ type: "text", text: "Edited the scripts" }],
+        },
+      },
+    ]);
+
+    await harness.invoke("session_start", {});
+    await harness.invoke("before_agent_start", { prompt: "Edit the scripts" });
+    await harness.invoke("turn_start", { turnIndex: 0 });
+    await harness.writeRepoFile("run.sh", "#!/bin/sh\necho after\n");
+    await harness.writeRepoFile("windows.txt", "one\r\ntwo\r\nthree\r\n");
+    await harness.invoke("turn_end", {
+      message: {
+        role: "assistant",
+        timestamp: assistantTimestamp,
+        content: [{ type: "text", text: "Edited the scripts" }],
+      },
+    });
+    await harness.invoke("agent_end", {});
+
+    harness.enqueueSelection("Restore files to that point");
+    const result = await harness.invoke("session_before_tree", { preparation: { targetId: "user-1" } });
+
+    assert.equal(result, undefined);
+    assert.equal(harness.readRepoFile("run.sh"), "#!/bin/sh\necho before\n");
+    assert.equal(harness.readRepoFile("windows.txt"), "one\r\ntwo\r\n");
+    assert.equal(harness.readRepoFile("untouched.sh"), "#!/bin/sh\necho untouched\n");
   } finally {
     await harness.cleanup();
   }
