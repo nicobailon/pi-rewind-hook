@@ -1,7 +1,7 @@
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { exec as execCb } from "child_process";
 import { existsSync, readFileSync, realpathSync } from "fs";
-import { mkdtemp, readdir, readFile, rm, stat } from "fs/promises";
+import { lstat, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "fs/promises";
 import { homedir, tmpdir } from "os";
 import { dirname, isAbsolute, join, relative, resolve } from "path";
 import { promisify } from "util";
@@ -22,6 +22,9 @@ const SNAPSHOT_CONFIG_PATTERN = "^(core\\.(autocrlf|eol|safecrlf|attributesfile|
 const SNAPSHOT_GIT =
   "git -c core.trustctime=true -c core.checkStat=default -c core.ignoreStat=false -c core.fsmonitor=false";
 const LIST_MAX_BUFFER = 512 * 1024 * 1024;
+// NTFS change times follow a coarse, adjustable clock, so a change this close before a
+// capture counts as after it.
+const CHANGE_TIME_MARGIN_NS = 1_000_000_000n;
 
 class UnsupportedSubmoduleStateError extends Error {}
 
@@ -89,10 +92,14 @@ interface SnapshotIndex {
   ignoreCase?: boolean;
   externalAttributeFiles?: string[];
   conversionInputs?: string;
+  // Windows only: the last capture's entries, and change times read when it started.
+  changeTime?: bigint;
+  entries?: SnapshotIndexListing["entries"];
+  changeTimes?: Map<string, bigint>;
 }
 
 interface SnapshotIndexListing {
-  entries: Array<{ record: string; path: string; ctimeSec: number }>;
+  entries: Array<{ record: string; path: string; ctimeSec: number; mtimeSec: number; size: number }>;
   conversionInputs: string;
 }
 
@@ -418,6 +425,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
   let forceConversationOnlyOnNextFork = false;
   let forceConversationOnlySource: string | null = null;
   let snapshotIndex: SnapshotIndex | null = null;
+  const changeTimeProbes = new Map<string, string>();
   let captureQueue: Promise<unknown> = Promise.resolve();
 
   function notify(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error" = "info") {
@@ -608,13 +616,13 @@ export default function rewindExtension(pi: ExtensionAPI) {
     });
     const entries: SnapshotIndexListing["entries"] = [];
     const attributeEntries: string[] = [];
-    const entryPattern = /([^\0]*)\0 {2}ctime: (\d+):\d+\n(?:.*\n){4}/y;
+    const entryPattern = /([^\0]*)\0 {2}ctime: (\d+):\d+\n {2}mtime: (\d+):\d+\n.*\n.*\n {2}size: (\d+)\t.*\n/y;
     while (entryPattern.lastIndex < stdout.length) {
       const match = entryPattern.exec(stdout);
       if (!match) throw new Error("Unexpected git ls-files --debug output");
-      const [, record, ctimeSec] = match;
+      const [, record, ctimeSec, mtimeSec, size] = match;
       const path = Buffer.from(record.slice(record.indexOf("\t") + 1), "latin1").toString("utf8");
-      entries.push({ record, path, ctimeSec: Number(ctimeSec) });
+      entries.push({ record, path, ctimeSec: Number(ctimeSec), mtimeSec: Number(mtimeSec), size: Number(size) });
       if (path === ".gitattributes" || path.endsWith("/.gitattributes")) attributeEntries.push(record);
     }
 
@@ -696,12 +704,66 @@ export default function rewindExtension(pi: ExtensionAPI) {
   async function forgetRacyStatData(root: string, env: NodeJS.ProcessEnv, listing: SnapshotIndexListing, startedSec: number) {
     // git compares whole-second ctimes, so a same-size write in the second a file was
     // hashed, with its mtime restored, looks unchanged. Any later write lands in a later second.
-    const racy = listing.entries.filter((entry) => entry.ctimeSec >= startedSec);
-    if (racy.length === 0) return;
+    await forgetStatData(root, env, listing.entries.filter((entry) => entry.ctimeSec >= startedSec));
+  }
+
+  async function forgetStatData(root: string, env: NodeJS.ProcessEnv, entries: SnapshotIndexListing["entries"]) {
+    if (entries.length === 0) return;
     // Re-staging an entry without stat data makes the next git add rehash it.
     const update = execAsync(`${SNAPSHOT_GIT} update-index -z --index-info`, { cwd: root, env });
-    update.child.stdin?.end(racy.map((entry) => `${entry.record}\0`).join(""), "latin1");
+    update.child.stdin?.end(entries.map((entry) => `${entry.record}\0`).join(""), "latin1");
     await update;
+  }
+
+  async function readVolumeChangeTime(root: string): Promise<bigint | undefined> {
+    let probe = changeTimeProbes.get(root);
+    if (!probe) {
+      const gitDir = (await execGitChecked(["-C", root, "rev-parse", "--git-dir"])).stdout.trim();
+      probe = join(resolve(root, gitDir), `pi-rewind-change-time-${process.pid}`);
+      changeTimeProbes.set(root, probe);
+    }
+    try {
+      // A file changed now carries the volume clock's current time as its change time.
+      await writeFile(probe, "");
+      await utimes(probe, 0, 0);
+      const [probeStats, rootStats] = await Promise.all([lstat(probe, { bigint: true }), lstat(root, { bigint: true })]);
+      // Volumes without change times (FAT, exFAT) report the mtime or nothing instead, and
+      // a git dir on another volume says nothing about the worktree's.
+      if (probeStats.dev !== rootStats.dev || probeStats.ctimeNs <= probeStats.mtimeNs) return undefined;
+      return probeStats.ctimeNs;
+    } catch {
+      // A read-only git dir falls back to a fresh index.
+      return undefined;
+    } finally {
+      await rm(probe, { force: true }).catch(() => {
+        // Best effort cleanup for the probe file.
+      });
+    }
+  }
+
+  async function forgetFilesChangedSinceLastCapture(root: string, env: NodeJS.ProcessEnv): Promise<Map<string, bigint> | undefined> {
+    const { changeTime, entries, changeTimes } = snapshotIndex ?? {};
+    // The last capture read no change times to compare with.
+    if (changeTime === undefined || !entries) return undefined;
+    const since = changeTime - CHANGE_TIME_MARGIN_NS;
+    // Node reports the NTFS change time as ctime.
+    const stats = await Promise.all(entries.map((entry) => lstat(join(root, entry.path), { bigint: true }).catch(() => undefined)));
+    const seen = new Map<string, bigint>();
+    const missed = entries.filter((entry, index) => {
+      const current = stats[index];
+      // git add -A drops deleted files.
+      if (!current) return false;
+      seen.set(entry.path, current.ctimeNs);
+      // git already rehashes a file whose size or whole-second mtime changed; the index keeps
+      // only the low 32 bits of the size.
+      if (BigInt.asUintN(32, current.size) !== BigInt(entry.size) || current.mtimeMs / 1000n !== BigInt(entry.mtimeSec)) return false;
+      // A window alone misses writes after the clock is set back, so also compare with the
+      // change time seen last time, which alone misses same-tick writes. Without one, rehash.
+      const previous = changeTimes?.get(entry.path);
+      return previous === undefined || current.ctimeNs >= since || current.ctimeNs !== previous;
+    });
+    await forgetStatData(root, env, missed);
+    return seen;
   }
 
   function captureWorktreeTree(): Promise<{ treeSha: string }> {
@@ -712,12 +774,23 @@ export default function rewindExtension(pi: ExtensionAPI) {
     const root = await getRepoRoot(pi.exec);
 
     try {
-      // Windows reports creation time as ctime, so its stat check can miss a rewrite.
-      if (process.platform === "win32") await disposeSnapshotIndex();
+      // Windows reports creation time as ctime, so its stat check can miss a rewrite that
+      // NTFS change times still show; without them, keep a fresh index per checkpoint.
+      const changeTime = process.platform === "win32" ? await readVolumeChangeTime(root) : undefined;
+      if (process.platform === "win32" && changeTime === undefined) await disposeSnapshotIndex();
       // Reusing the index lets git rehash only files whose stat data changed.
-      const reused = snapshotIndex?.root === root;
+      let reused = snapshotIndex?.root === root;
       const startedSec = Math.floor(Date.now() / 1000);
       let env = await getSnapshotIndexEnv(root);
+      let changeTimes: Map<string, bigint> | undefined;
+      if (reused && changeTime !== undefined) {
+        changeTimes = await forgetFilesChangedSinceLastCapture(root, env);
+        if (!changeTimes) {
+          await disposeSnapshotIndex();
+          reused = false;
+          env = await getSnapshotIndexEnv(root);
+        }
+      }
       // Git for Windows' default autocrlf=true would restore LF files as CRLF.
       await execAsync(`${SNAPSHOT_GIT} -c core.autocrlf=false add -A`, { cwd: root, env });
       let listing = await inspectSnapshotIndex(root, env);
@@ -729,6 +802,9 @@ export default function rewindExtension(pi: ExtensionAPI) {
         listing = await inspectSnapshotIndex(root, env);
       }
       snapshotIndex!.conversionInputs = listing.conversionInputs;
+      snapshotIndex!.changeTime = changeTime;
+      snapshotIndex!.entries = changeTime === undefined ? undefined : listing.entries;
+      snapshotIndex!.changeTimes = changeTimes;
 
       const { stdout } = await execAsync(`${SNAPSHOT_GIT} write-tree`, { cwd: root, env });
       const treeSha = stdout.trim();
