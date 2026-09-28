@@ -4,8 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.8.7] - 2026-09-28
+
+### Highlights
+- Checkpoints in large repositories are much faster: Rewind now only re-reads files that changed since the last checkpoint instead of every file each time.
+- Windows gets the same speedup, cutting a checkpoint in a 20,000-file repository from about 9 seconds to about 1.
+- Restoring files keeps their exact line endings when Git's `core.autocrlf` is on, which is the Git for Windows default.
+
 ### Changed
-- Checkpoints reuse one private snapshot index per session, so `git add -A` only rehashes files whose stat data changed and large repositories checkpoint much faster. The index is rebuilt when attributes, conversion config, ignore rules or case-only renames could change the result; reuse forces Git's strictest stat check and rehashes files written in the second they were last captured. On Windows, where Git stores creation time as ctime, it also rehashes files whose NTFS change time moved since the last capture; volumes without change times keep a fresh index per checkpoint. On filesystems where every write updates the file's ctime, each checkpoint records the same tree as a fresh index. Thanks to [@wyruweso](https://github.com/wyruweso) for #16 and #18.
+- Checkpoints reuse one snapshot index per session, so Rewind only re-reads files that changed since the last checkpoint and large repositories checkpoint much faster. Each checkpoint still records exactly the same files as before. Rewind starts a fresh index when `.gitattributes`, line-ending settings, ignore rules, or case-only renames could change the result. On Windows, Rewind uses NTFS change times to catch rewrites Git would otherwise miss; on drives without them, such as FAT or exFAT, it keeps a fresh index per checkpoint. Thanks to [@wyruweso](https://github.com/wyruweso) for #16 and #18.
 
 ### Fixed
 - File restores keep exact line endings when `core.autocrlf` is enabled, the Git for Windows default, instead of rewriting LF files as CRLF. Thanks to [@wyruweso](https://github.com/wyruweso) for #15.
