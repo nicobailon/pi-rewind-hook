@@ -53,6 +53,11 @@ class SessionManagerStub {
     this.flush();
   }
 
+  appendEntries(...entries: RewindEntry[]): void {
+    this.entries.push(...entries);
+    this.flush();
+  }
+
   appendCustom(customType: string, data: unknown): void {
     const parentId = (this.entries.at(-1)?.id as string | undefined) ?? null;
     this.entries.push({
@@ -1100,6 +1105,51 @@ test("session_before_tree restores exact file bytes when core.autocrlf is enable
     assert.equal(harness.readRepoFile("run.sh"), "#!/bin/sh\necho before\n");
     assert.equal(harness.readRepoFile("windows.txt"), "one\r\ntwo\r\n");
     assert.equal(harness.readRepoFile("untouched.sh"), "#!/bin/sh\necho untouched\n");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("each prompt restores the files from before it when pi appends the prompt after turn_start", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    await harness.writeRepoFile("notes.txt", "zero\n");
+    await harness.invoke("session_start", {});
+    const timestamp = Date.now();
+    for (const [index, content] of ["one\n", "two\n"].entries()) {
+      const assistantMessage = { role: "assistant", timestamp: timestamp + index, content: [{ type: "text", text: "Edited the notes" }] };
+      await harness.invoke("before_agent_start", { prompt: "Edit the notes" });
+      await harness.invoke("turn_start", { turnIndex: 0 });
+      // pi emits turn_start before it appends the prompt's user entry.
+      harness.currentSession.appendEntries(
+        {
+          type: "message",
+          id: `user-${index + 1}`,
+          parentId: null,
+          timestamp: new Date(timestamp + index).toISOString(),
+          message: { role: "user", content: [{ type: "text", text: "Edit the notes" }] },
+        },
+        {
+          type: "message",
+          id: `assistant-${index + 1}`,
+          parentId: `user-${index + 1}`,
+          timestamp: new Date(timestamp + index).toISOString(),
+          message: assistantMessage,
+        },
+      );
+      await harness.writeRepoFile("notes.txt", content);
+      await harness.invoke("turn_end", { message: assistantMessage });
+      await harness.invoke("agent_end", {});
+    }
+
+    harness.enqueueSelection("Restore files to that point");
+    await harness.invoke("session_before_tree", { preparation: { targetId: "user-2" } });
+    assert.equal(harness.readRepoFile("notes.txt"), "one\n");
+
+    harness.enqueueSelection("Restore files to that point");
+    await harness.invoke("session_before_tree", { preparation: { targetId: "user-1" } });
+    assert.equal(harness.readRepoFile("notes.txt"), "zero\n");
   } finally {
     await harness.cleanup();
   }
