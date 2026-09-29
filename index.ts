@@ -1629,14 +1629,13 @@ export default function rewindExtension(pi: ExtensionAPI) {
     try {
       const { treeSha } = await captureWorktreeTree();
       const commitSha = await ensureSnapshotForTree(treeSha);
+      // pi appends the prompt's user entry after turn_start, so turn_end binds this snapshot to it.
       promptCollector = {
         snapshots: [],
         bindings: [],
         promptText: activePromptText ?? undefined,
         pendingUserCommitSha: commitSha,
       };
-
-      bindPendingPromptUser(ctx.sessionManager.getBranch() as SessionLikeEntry[], promptCollector);
     } catch (error) {
       promptCollector = null;
       notify(ctx, `Rewind: failed to capture start snapshot (${error instanceof Error ? error.message : String(error)})`, "warning");
