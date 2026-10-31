@@ -4,10 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.8.8] - 2026-10-31
+
+### Highlights
+- Restoring files to an earlier prompt now brings back the files from right before that prompt. Before, every prompt after the first restored one step too late, and the newest prompt had no file restore at all.
+- Background jobs and other extensions that wake the session no longer break the restore point of the prompt before them.
+- Automatic retries after an error no longer break that restore point either.
+
 ### Fixed
-- Rewind typechecks against Pi 1.2 and newer, where runs started by an extension message carry no prompt text.
 - Restoring files to a prompt brings back the files from before that prompt. Before, every prompt after the first restored the files from before the next prompt, and the newest prompt had no file restore. Thanks to [@wyruweso](https://github.com/wyruweso) for #19 and [@ismailokta](https://github.com/ismailokta) for reporting #20.
-- A run started by an extension message, such as a background job finishing, or by an automatic retry after an error, no longer overwrites the previous prompt's file restore point (#22).
+- When an extension wakes the session, for example when a background job finishes, or Pi retries automatically after an error, the prompt before it keeps its own file restore point. Before, restoring to that prompt brought back the files from after it ran (#22).
+- Rewind's source typechecks against Pi 1.2 and newer (#21).
 
 ## [1.8.7] - 2026-09-28
 
