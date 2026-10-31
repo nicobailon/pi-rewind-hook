@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 - Rewind typechecks against Pi 1.2 and newer, where runs started by an extension message carry no prompt text.
+- Restoring files to a prompt brings back the files from before that prompt. Before, every prompt after the first restored the files from before the next prompt, and the newest prompt had no file restore. Thanks to [@wyruweso](https://github.com/wyruweso) for #19 and [@ismailokta](https://github.com/ismailokta) for reporting #20.
+- A run started by an extension message, such as a background job finishing, or by an automatic retry after an error, no longer overwrites the previous prompt's file restore point (#22).
 
 ## [1.8.7] - 2026-09-28
 

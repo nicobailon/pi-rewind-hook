@@ -666,7 +666,7 @@ test("first mutating turn creates a reachable store ref even when retention is o
 
   try {
     const assistantTimestamp = Date.now();
-    harness.currentSession.replaceEntries([
+    const promptEntries = [
       {
         type: "message",
         id: "user-1",
@@ -685,11 +685,12 @@ test("first mutating turn creates a reachable store ref even when retention is o
           content: [{ type: "text", text: "Created the file" }],
         },
       },
-    ]);
+    ];
 
     await harness.invoke("session_start", {});
     await harness.invoke("before_agent_start", { prompt: "Please create the file" });
     await harness.invoke("turn_start", { turnIndex: 0 });
+    harness.currentSession.appendEntries(...promptEntries);
     await harness.writeRepoFile("tests/rewind-smoke/a.txt", "smoke test\n");
     await harness.invoke("turn_end", {
       message: {
@@ -1063,7 +1064,7 @@ test("session_before_tree restores exact file bytes when core.autocrlf is enable
     await harness.writeRepoFile("untouched.sh", "#!/bin/sh\necho untouched\n");
 
     const assistantTimestamp = Date.now();
-    harness.currentSession.replaceEntries([
+    const promptEntries = [
       {
         type: "message",
         id: "user-1",
@@ -1082,11 +1083,12 @@ test("session_before_tree restores exact file bytes when core.autocrlf is enable
           content: [{ type: "text", text: "Edited the scripts" }],
         },
       },
-    ]);
+    ];
 
     await harness.invoke("session_start", {});
     await harness.invoke("before_agent_start", { prompt: "Edit the scripts" });
     await harness.invoke("turn_start", { turnIndex: 0 });
+    harness.currentSession.appendEntries(...promptEntries);
     await harness.writeRepoFile("run.sh", "#!/bin/sh\necho after\n");
     await harness.writeRepoFile("windows.txt", "one\r\ntwo\r\nthree\r\n");
     await harness.invoke("turn_end", {
@@ -1146,6 +1148,71 @@ test("each prompt restores the files from before it when pi appends the prompt a
     harness.enqueueSelection("Restore files to that point");
     await harness.invoke("session_before_tree", { preparation: { targetId: "user-2" } });
     assert.equal(harness.readRepoFile("notes.txt"), "one\n");
+
+    harness.enqueueSelection("Restore files to that point");
+    await harness.invoke("session_before_tree", { preparation: { targetId: "user-1" } });
+    assert.equal(harness.readRepoFile("notes.txt"), "zero\n");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("only a user entry added during the run gets that run's start snapshot", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    await harness.writeRepoFile("notes.txt", "zero\n");
+    await harness.invoke("session_start", {});
+    const timestamp = Date.now();
+    const promptReply = { role: "assistant", timestamp, content: [{ type: "text", text: "Wrote one" }] };
+    await harness.invoke("before_agent_start", { messageType: "user", prompt: "Write one" });
+    await harness.invoke("turn_start", { turnIndex: 0 });
+    harness.currentSession.appendEntries(
+      { type: "message", id: "user-1", parentId: null, timestamp: new Date(timestamp).toISOString(), message: { role: "user", content: [{ type: "text", text: "Write one" }] } },
+      { type: "message", id: "assistant-1", parentId: "user-1", timestamp: new Date(timestamp).toISOString(), message: promptReply },
+    );
+    await harness.writeRepoFile("notes.txt", "one\n");
+    await harness.invoke("turn_end", { message: promptReply });
+    await harness.invoke("agent_end", {});
+
+    const customReply = { role: "assistant", timestamp: timestamp + 1, content: [{ type: "text", text: "Wrote two" }] };
+    await harness.invoke("before_agent_start", { messageType: "custom", message: { role: "custom", customType: "wake", content: "Job finished" } });
+    await harness.invoke("turn_start", { turnIndex: 0 });
+    harness.currentSession.appendEntries(
+      { type: "custom_message", id: "wake-1", parentId: "assistant-1", timestamp: new Date(timestamp + 1).toISOString(), customType: "wake", content: "Job finished", display: true },
+      { type: "message", id: "assistant-2", parentId: "wake-1", timestamp: new Date(timestamp + 1).toISOString(), message: customReply },
+    );
+    await harness.writeRepoFile("notes.txt", "two\n");
+    await harness.invoke("turn_end", { message: customReply });
+    // The user steers the extension's run; pi adds the message in turn 1.
+    const steerReply = { role: "assistant", timestamp: timestamp + 1, content: [{ type: "text", text: "Steered" }] };
+    await harness.invoke("turn_start", { turnIndex: 1 });
+    harness.currentSession.appendEntries(
+      { type: "message", id: "steer-1", parentId: "assistant-2", timestamp: new Date(timestamp + 1).toISOString(), message: { role: "user", content: [{ type: "text", text: "Also check" }] } },
+      { type: "message", id: "assistant-steer", parentId: "steer-1", timestamp: new Date(timestamp + 1).toISOString(), message: steerReply },
+    );
+    await harness.invoke("turn_end", { message: steerReply });
+    await harness.invoke("agent_end", {});
+    const boundIds = harness.currentSession
+      .getEntries()
+      .filter((entry) => entry.type === "custom" && entry.customType === "rewind-turn")
+      .flatMap((entry) => (entry.data as { bindings: [string, number][] }).bindings.map(([id]) => id));
+    assert.equal(boundIds.includes("steer-1"), false);
+
+    // A prompt queued while pi finishes a run starts a new run without before_agent_start.
+    const queuedReply = { role: "assistant", timestamp: timestamp + 2, content: [{ type: "text", text: "Wrote three" }] };
+    await harness.invoke("turn_start", { turnIndex: 0 });
+    harness.currentSession.appendEntries(
+      { type: "message", id: "user-3", parentId: "assistant-2", timestamp: new Date(timestamp + 2).toISOString(), message: { role: "user", content: [{ type: "text", text: "Write three" }] } },
+      { type: "message", id: "assistant-3", parentId: "user-3", timestamp: new Date(timestamp + 2).toISOString(), message: queuedReply },
+    );
+    await harness.writeRepoFile("notes.txt", "three\n");
+    await harness.invoke("turn_end", { message: queuedReply });
+    await harness.invoke("agent_end", {});
+
+    harness.enqueueSelection("Restore files to that point");
+    await harness.invoke("session_before_tree", { preparation: { targetId: "user-3" } });
+    assert.equal(harness.readRepoFile("notes.txt"), "two\n");
 
     harness.enqueueSelection("Restore files to that point");
     await harness.invoke("session_before_tree", { preparation: { targetId: "user-1" } });
