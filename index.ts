@@ -1631,11 +1631,12 @@ export default function rewindExtension(pi: ExtensionAPI) {
       const { treeSha } = await captureWorktreeTree();
       const commitSha = await ensureSnapshotForTree(treeSha);
       // pi appends the prompt's user entry after turn_start, so turn_end binds this snapshot to it.
+      // A run started by an extension message has no user entry; binding would overwrite the previous prompt's.
       promptCollector = {
         snapshots: [],
         bindings: [],
         promptText: activePromptText ?? undefined,
-        pendingUserCommitSha: commitSha,
+        pendingUserCommitSha: activePromptText === null ? undefined : commitSha,
       };
     } catch (error) {
       promptCollector = null;

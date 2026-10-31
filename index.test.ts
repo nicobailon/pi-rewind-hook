@@ -1155,6 +1155,43 @@ test("each prompt restores the files from before it when pi appends the prompt a
   }
 });
 
+test("a run started by an extension message keeps the previous prompt's restore point", async () => {
+  const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
+
+  try {
+    await harness.writeRepoFile("notes.txt", "zero\n");
+    await harness.invoke("session_start", {});
+    const timestamp = Date.now();
+    const promptReply = { role: "assistant", timestamp, content: [{ type: "text", text: "Wrote one" }] };
+    await harness.invoke("before_agent_start", { messageType: "user", prompt: "Write one" });
+    await harness.invoke("turn_start", { turnIndex: 0 });
+    harness.currentSession.appendEntries(
+      { type: "message", id: "user-1", parentId: null, timestamp: new Date(timestamp).toISOString(), message: { role: "user", content: [{ type: "text", text: "Write one" }] } },
+      { type: "message", id: "assistant-1", parentId: "user-1", timestamp: new Date(timestamp).toISOString(), message: promptReply },
+    );
+    await harness.writeRepoFile("notes.txt", "one\n");
+    await harness.invoke("turn_end", { message: promptReply });
+    await harness.invoke("agent_end", {});
+
+    const customReply = { role: "assistant", timestamp: timestamp + 1, content: [{ type: "text", text: "Wrote two" }] };
+    await harness.invoke("before_agent_start", { messageType: "custom", message: { role: "custom", customType: "wake", content: "Job finished" } });
+    await harness.invoke("turn_start", { turnIndex: 0 });
+    harness.currentSession.appendEntries(
+      { type: "custom_message", id: "wake-1", parentId: "assistant-1", timestamp: new Date(timestamp + 1).toISOString(), customType: "wake", content: "Job finished", display: true },
+      { type: "message", id: "assistant-2", parentId: "wake-1", timestamp: new Date(timestamp + 1).toISOString(), message: customReply },
+    );
+    await harness.writeRepoFile("notes.txt", "two\n");
+    await harness.invoke("turn_end", { message: customReply });
+    await harness.invoke("agent_end", {});
+
+    harness.enqueueSelection("Restore files to that point");
+    await harness.invoke("session_before_tree", { preparation: { targetId: "user-1" } });
+    assert.equal(harness.readRepoFile("notes.txt"), "zero\n");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 type Harness = Awaited<ReturnType<typeof createHarness>>;
 
 async function freshIndexTree(repoRoot: string): Promise<string> {
