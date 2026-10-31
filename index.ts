@@ -1538,7 +1538,8 @@ export default function rewindExtension(pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event) => {
-    activePromptText = event.prompt;
+    // Pi before 1.2 sends no messageType, and those events always carry a prompt.
+    activePromptText = event.messageType === "custom" ? null : event.prompt;
   });
 
   pi.on("session_start", async (event, ctx) => {

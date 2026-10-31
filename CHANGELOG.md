@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Rewind typechecks against Pi 1.2 and newer, where runs started by an extension message carry no prompt text.
+
 ## [1.8.7] - 2026-09-28
 
 ### Highlights
