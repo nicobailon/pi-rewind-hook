@@ -74,6 +74,8 @@ interface ActivePromptCollector {
   bindings: BindingTuple[];
   promptText?: string;
   pendingUserCommitSha?: string;
+  /** Branch length at turn_start; only user entries appended after it belong to this run. */
+  startBranchLength: number;
 }
 
 interface ExactState {
@@ -997,7 +999,8 @@ export default function rewindExtension(pi: ExtensionAPI) {
   function bindPendingPromptUser(entries: SessionLikeEntry[], collector: ActivePromptCollector) {
     if (!collector.pendingUserCommitSha) return;
 
-    const userEntry = findLatestMatchingUserMessageEntry(entries, collector.promptText) ?? findLatestUserMessageEntry(entries);
+    const runEntries = entries.slice(collector.startBranchLength);
+    const userEntry = findLatestMatchingUserMessageEntry(runEntries, collector.promptText) ?? findLatestUserMessageEntry(runEntries);
     if (!userEntry) return;
     if (collector.bindings.some(([entryId]) => entryId === userEntry.id)) {
       collector.pendingUserCommitSha = undefined;
@@ -1628,15 +1631,17 @@ export default function rewindExtension(pi: ExtensionAPI) {
     if (event.turnIndex !== 0) return;
 
     try {
+      const startBranchLength = ctx.sessionManager.getBranch().length;
       const { treeSha } = await captureWorktreeTree();
       const commitSha = await ensureSnapshotForTree(treeSha);
       // pi appends the prompt's user entry after turn_start, so turn_end binds this snapshot to it.
-      // A run started by an extension message has no user entry; binding would overwrite the previous prompt's.
+      // Runs started by an extension message or a retry add no user entry and bind nothing.
       promptCollector = {
         snapshots: [],
         bindings: [],
         promptText: activePromptText ?? undefined,
-        pendingUserCommitSha: activePromptText === null ? undefined : commitSha,
+        pendingUserCommitSha: commitSha,
+        startBranchLength,
       };
     } catch (error) {
       promptCollector = null;
