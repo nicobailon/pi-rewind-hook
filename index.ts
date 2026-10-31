@@ -1655,6 +1655,8 @@ export default function rewindExtension(pi: ExtensionAPI) {
     try {
       const branchEntries = ctx.sessionManager.getBranch() as SessionLikeEntry[];
       bindPendingPromptUser(branchEntries, promptCollector);
+      // The run's own user entry lands in turn 0; a steer in a later turn must not take the run's start snapshot.
+      promptCollector.pendingUserCommitSha = undefined;
 
       if (event.message.role !== "assistant") return;
 

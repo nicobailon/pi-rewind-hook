@@ -1184,7 +1184,20 @@ test("only a user entry added during the run gets that run's start snapshot", as
     );
     await harness.writeRepoFile("notes.txt", "two\n");
     await harness.invoke("turn_end", { message: customReply });
+    // The user steers the extension's run; pi adds the message in turn 1.
+    const steerReply = { role: "assistant", timestamp: timestamp + 1, content: [{ type: "text", text: "Steered" }] };
+    await harness.invoke("turn_start", { turnIndex: 1 });
+    harness.currentSession.appendEntries(
+      { type: "message", id: "steer-1", parentId: "assistant-2", timestamp: new Date(timestamp + 1).toISOString(), message: { role: "user", content: [{ type: "text", text: "Also check" }] } },
+      { type: "message", id: "assistant-steer", parentId: "steer-1", timestamp: new Date(timestamp + 1).toISOString(), message: steerReply },
+    );
+    await harness.invoke("turn_end", { message: steerReply });
     await harness.invoke("agent_end", {});
+    const boundIds = harness.currentSession
+      .getEntries()
+      .filter((entry) => entry.type === "custom" && entry.customType === "rewind-turn")
+      .flatMap((entry) => (entry.data as { bindings: [string, number][] }).bindings.map(([id]) => id));
+    assert.equal(boundIds.includes("steer-1"), false);
 
     // A prompt queued while pi finishes a run starts a new run without before_agent_start.
     const queuedReply = { role: "assistant", timestamp: timestamp + 2, content: [{ type: "text", text: "Wrote three" }] };
