@@ -941,6 +941,54 @@ test("retention retries a ref rewrite that races with a new snapshot", async () 
   }
 });
 
+test("a startup retention sweep keeps the snapshot a resumed session reuses for its next prompt", async () => {
+  const harness = await createHarness({
+    settings: { rewind: { retention: { maxAgeDays: 30, pinLabeledEntries: true } } },
+  });
+
+  try {
+    await harness.writeRepoFile("notes.txt", "before\n");
+    const labeledCommit = await harness.captureSnapshot();
+    await harness.writeRepoFile("notes.txt", "after\n");
+    const reusedCommit = await harness.captureSnapshot();
+    await harness.updateStoreRef(reusedCommit);
+
+    const old = Date.now() - 40 * 24 * 60 * 60 * 1000;
+    harness.currentSession.replaceEntries([
+      { type: "message", id: "user-1", parentId: null, timestamp: new Date(old).toISOString(), message: { role: "user", content: [{ type: "text", text: "Edit the notes" }] } },
+      { type: "message", id: "assistant-1", parentId: "user-1", timestamp: new Date(old).toISOString(), message: { role: "assistant", timestamp: old, content: [{ type: "text", text: "Edited the notes" }] } },
+      { type: "custom", customType: "rewind-turn", id: "rewind-turn-1", parentId: "assistant-1", timestamp: new Date(old).toISOString(), data: { v: 2, snapshots: [labeledCommit, reusedCommit], bindings: [["user-1", 0], ["assistant-1", 1]] } },
+      { type: "label", id: "label-1", parentId: "rewind-turn-1", timestamp: new Date(old).toISOString(), targetId: "user-1", label: "start" },
+    ]);
+
+    await harness.invoke("session_start", { reason: "resume" });
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && await harness.revParseStore() === reusedCommit) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    // A prompt that changes no files binds its restore point to the reused commit.
+    const assistantMessage = { role: "assistant", timestamp: Date.now(), content: [{ type: "text", text: "Checked the notes" }] };
+    await harness.invoke("before_agent_start", { prompt: "Check the notes" });
+    await harness.invoke("turn_start", { turnIndex: 0 });
+    harness.currentSession.appendEntries(
+      { type: "message", id: "user-2", parentId: "label-1", timestamp: new Date().toISOString(), message: { role: "user", content: [{ type: "text", text: "Check the notes" }] } },
+      { type: "message", id: "assistant-2", parentId: "user-2", timestamp: new Date().toISOString(), message: assistantMessage },
+    );
+    await harness.invoke("turn_end", { message: assistantMessage });
+    await harness.invoke("agent_end", {});
+
+    const turn = harness.currentSession.getEntries().filter((entry) => entry.customType === "rewind-turn").at(-1);
+    assert.deepEqual((turn?.data as { snapshots: string[] }).snapshots, [reusedCommit]);
+    const storeHead = await harness.revParseStore();
+    assert.ok(storeHead && storeHead !== reusedCommit, "the startup sweep did not run");
+    assert.equal(await harness.isAncestor(labeledCommit, storeHead), true);
+    assert.equal(await harness.isAncestor(reusedCommit, storeHead), true);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("session_before_tree restores a local submodule gitlink commit", async () => {
   const harness = await createHarness({ settings: { rewind: { silentCheckpoints: true } } });
 

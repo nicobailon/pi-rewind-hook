@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 - Rewind no longer shows a "failed to finalize rewind turn" warning after every prompt and session switch in hosts whose UI has no theme, such as pi-web-ui. The status line falls back to plain text. Thanks to [@wu546526](https://github.com/wu546526) for reporting and diagnosing #24.
+- Resuming a session whose files haven't changed keeps the restore point of its next prompt when retention is on. Before, the startup retention sweep could drop that snapshot and `git gc` could then delete it. Thanks to [@w-winter](https://github.com/w-winter) for reporting and diagnosing #26.
 
 ## [1.8.8] - 2026-10-31
 
