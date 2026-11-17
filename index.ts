@@ -1,7 +1,7 @@
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { exec as execCb } from "child_process";
 import { existsSync, readFileSync, realpathSync } from "fs";
-import { lstat, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "fs/promises";
+import { lstat, mkdtemp, open, readdir, readFile, rm, stat, utimes, writeFile } from "fs/promises";
 import { homedir, tmpdir } from "os";
 import { dirname, isAbsolute, join, relative, resolve } from "path";
 import { promisify } from "util";
@@ -41,7 +41,6 @@ interface RewindSettings {
       maxSnapshots?: number;
       maxAgeDays?: number;
       pinLabeledEntries?: boolean;
-      scanMode?: "ancestor-only" | "repo-sessions";
       startupBudgetMs?: number;
     };
   };
@@ -224,10 +223,6 @@ function getRetentionSettings(): RewindRetentionSettings | undefined {
   return getSettings().rewind?.retention;
 }
 
-function getRetentionScanMode(): "ancestor-only" | "repo-sessions" {
-  return getRetentionSettings()?.scanMode === "repo-sessions" ? "repo-sessions" : "ancestor-only";
-}
-
 function getStartupSweepBudgetMs(): number | undefined {
   const value = getRetentionSettings()?.startupBudgetMs;
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
@@ -265,10 +260,40 @@ function canonicalizePath(value: string): string {
 }
 
 function isInsidePath(targetPath: string, parentPath: string): boolean {
-  const resolvedTarget = canonicalizePath(targetPath);
-  const resolvedParent = canonicalizePath(parentPath);
-  const rel = relative(resolvedParent, resolvedTarget);
+  return isInsideCanonicalPath(canonicalizePath(targetPath), canonicalizePath(parentPath));
+}
+
+function isInsideCanonicalPath(targetPath: string, parentPath: string): boolean {
+  const rel = relative(parentPath, targetPath);
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+const SESSION_HEADER_READ_BYTES = 16 * 1024;
+
+async function readSessionHeaderCwd(sessionFile: string): Promise<string | undefined> {
+  let text: string;
+  try {
+    const file = await open(sessionFile, "r");
+    try {
+      const buffer = Buffer.alloc(SESSION_HEADER_READ_BYTES);
+      const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+      text = buffer.toString("utf-8", 0, bytesRead);
+    } finally {
+      await file.close();
+    }
+  } catch {
+    // Skip unreadable session files during best-effort discovery.
+    return undefined;
+  }
+
+  const newline = text.indexOf("\n");
+  try {
+    const header = JSON.parse(newline >= 0 ? text.slice(0, newline) : text);
+    return header?.type === "session" && typeof header.cwd === "string" ? header.cwd : undefined;
+  } catch {
+    // Ignore files whose first line is not a session header.
+    return undefined;
+  }
 }
 
 function toTimestamp(value: string | undefined): number {
@@ -832,6 +857,18 @@ export default function rewindExtension(pi: ExtensionAPI) {
     return result.code === 0;
   }
 
+  async function getExistingCommits(commitShas: string[]): Promise<Set<string>> {
+    // Only full object names: a ledger value with a space or newline would make the batch output ambiguous.
+    const names = commitShas.filter((commitSha) => /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(commitSha));
+    if (names.length === 0) return new Set();
+    // One process for the whole batch; pi.exec has no stdin.
+    const check = execAsync("git cat-file --batch-check", { cwd: await getRepoRoot(pi.exec), maxBuffer: LIST_MAX_BUFFER });
+    check.child.stdin?.end(names.map((name) => `${name}\n`).join(""));
+    const { stdout } = await check;
+    // Lines are "<sha> <type> <size>", or "<sha> missing".
+    return new Set(stdout.split("\n").map((line) => line.split(" ")).filter(([, type]) => type === "commit").map(([commitSha]) => commitSha));
+  }
+
   async function getStoreHead(): Promise<string | undefined> {
     const result = await pi.exec("git", ["rev-parse", "--verify", STORE_REF]);
     if (result.code !== 0) {
@@ -880,39 +917,43 @@ export default function rewindExtension(pi: ExtensionAPI) {
     throw new Error(`failed to update rewind store ref: ${detail}`);
   }
 
-  async function rewriteStoreToLiveSet(liveCommitShas: string[]): Promise<"rewritten" | "preserved-empty"> {
-    const uniqueLiveCommits = [...new Set(liveCommitShas.filter(Boolean))];
-    if (uniqueLiveCommits.length === 0) {
-      return "preserved-empty";
-    }
-
+  async function rewriteStore(liveCommitShas: string[], expiredCommitShas: Set<string>): Promise<void> {
     let attempts = 0;
     let lastError: unknown;
-    let preserveConcurrentHead = false;
 
     while (attempts < 5) {
       attempts += 1;
       const oldHead = await getStoreHead();
-      // A failed compare-and-swap means another session added snapshots while
-      // this sweep was running. Preserve that new reachability and let a later
-      // uncontended sweep prune anything no longer retained.
-      let head = preserveConcurrentHead ? oldHead : undefined;
-      for (const commitSha of uniqueLiveCommits) {
+      // Other sessions share the store, so only drop snapshots this sweep read and expired.
+      // Members are re-read from the head the compare-and-swap uses, which keeps concurrent appends.
+      // Snapshots are root commits; keepalive commits always have parents.
+      const members = oldHead
+        ? (await execGitChecked(["rev-list", "--max-parents=0", oldHead])).stdout.split("\n").filter(Boolean)
+        : [];
+      const memberSet = new Set(members);
+      const kept = members.filter((commitSha) => !expiredCommitShas.has(commitSha));
+      const added = liveCommitShas.filter((commitSha) => !memberSet.has(commitSha));
+      if (kept.length === members.length && added.length === 0) {
+        return;
+      }
+
+      let head: string | undefined;
+      for (const commitSha of [...kept, ...added]) {
         head = await createStoreKeepaliveCommit(commitSha, head);
       }
 
       try {
-        if (oldHead) {
-          await execGitChecked(["update-ref", STORE_REF, head!, oldHead]);
+        if (head) {
+          await execGitChecked(["update-ref", STORE_REF, head, oldHead ?? LEGACY_ZERO_SHA]);
         } else {
-          await execGitChecked(["update-ref", STORE_REF, head!, LEGACY_ZERO_SHA]);
+          // Every member expired, so nothing is left to keep alive.
+          await execGitChecked(["update-ref", "-d", STORE_REF, oldHead!]);
         }
-        return "rewritten";
+        return;
       } catch (error) {
         // Retry if another process updated the store ref concurrently.
         // Keep the most recent error for actionable failure context.
         lastError = error;
-        preserveConcurrentHead = true;
       }
     }
 
@@ -1286,41 +1327,43 @@ export default function rewindExtension(pi: ExtensionAPI) {
     }
   }
 
-  async function discoverSessionFiles(scanMode: "ancestor-only" | "repo-sessions"): Promise<string[]> {
+  // Every worktree of a repository shares refs/pi-rewind/store, so a sweep reads the sessions of all of them.
+  async function discoverSessionFiles(isInsideRepo: (cwd: string) => boolean): Promise<string[]> {
     const discovered = new Set<string>();
 
-    if (scanMode === "repo-sessions") {
-      const roots = new Set<string>();
-      const defaultSessionsDir = getDefaultSessionsDir();
-      if (existsSync(defaultSessionsDir)) {
-        roots.add(defaultSessionsDir);
-      }
-      if (currentSessionFile) {
-        roots.add(dirname(currentSessionFile));
+    const roots = new Set<string>();
+    const defaultSessionsDir = getDefaultSessionsDir();
+    if (existsSync(defaultSessionsDir)) {
+      roots.add(defaultSessionsDir);
+    }
+    if (currentSessionFile) {
+      roots.add(dirname(currentSessionFile));
+    }
+
+    const stack = [...roots];
+    while (stack.length > 0) {
+      const dir = stack.pop();
+      if (!dir) continue;
+
+      let entries: Awaited<ReturnType<typeof readdir>>;
+      try {
+        entries = await readdir(dir, { withFileTypes: true });
+      } catch {
+        // Skip unreadable directories during best-effort discovery.
+        continue;
       }
 
-      const stack = [...roots];
-      while (stack.length > 0) {
-        const dir = stack.pop();
-        if (!dir) continue;
-
-        let entries: Awaited<ReturnType<typeof readdir>>;
-        try {
-          entries = await readdir(dir, { withFileTypes: true });
-        } catch {
-          // Skip unreadable directories during best-effort discovery.
+      for (const entry of entries) {
+        const fullPath = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          stack.push(fullPath);
           continue;
         }
-
-        for (const entry of entries) {
-          const fullPath = join(dir, entry.name);
-          if (entry.isDirectory()) {
-            stack.push(fullPath);
-            continue;
-          }
-          if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-            discovered.add(fullPath);
-          }
+        if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+        // Read only the header first; most sessions belong to other repositories.
+        const cwd = await readSessionHeaderCwd(fullPath);
+        if (cwd && isInsideRepo(cwd)) {
+          discovered.add(fullPath);
         }
       }
     }
@@ -1354,13 +1397,20 @@ export default function rewindExtension(pi: ExtensionAPI) {
     const retention = getRetentionSettings();
     if (!retention) return;
 
-    const scanMode = getRetentionScanMode();
     const startupBudgetMs = reason === "startup" ? getStartupSweepBudgetMs() : undefined;
     const startedAt = Date.now();
 
     const budgetExceeded = () => typeof startupBudgetMs === "number" && Date.now() - startedAt > startupBudgetMs;
 
-    const sessionFiles = await discoverSessionFiles(scanMode);
+    const worktreePaths = (await execGitChecked(["worktree", "list", "--porcelain"])).stdout
+      .split("\n")
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => canonicalizePath(line.slice("worktree ".length)));
+    const isInsideRepo = (cwd: string) => {
+      const target = canonicalizePath(cwd);
+      return worktreePaths.some((worktreePath) => isInsideCanonicalPath(target, worktreePath));
+    };
+    const sessionFiles = await discoverSessionFiles(isInsideRepo);
     if (budgetExceeded()) {
       notify(ctx, `Rewind retention startup sweep skipped after exceeding ${startupBudgetMs}ms budget`, "warning");
       return;
@@ -1376,12 +1426,13 @@ export default function rewindExtension(pi: ExtensionAPI) {
 
       const ledger = sessionFile === currentSessionFile ? buildCurrentSessionLedger(ctx) : await parseSessionLedgerFile(sessionFile);
       if (!ledger?.cwd) continue;
-      if (!isInsidePath(ledger.cwd, repoRoot)) continue;
+      // parentSession ancestors skip discovery's header filter.
+      if (!isInsideRepo(ledger.cwd)) continue;
       ledgers.push(ledger);
     }
 
     const latestReferenceByCommit = new Map<string, number>();
-    const pinnedCommits = new Set<string>();
+    const labeledCommits = new Set<string>();
     const currentCommits = new Set<string>();
     const undoCommits = new Set<string>();
 
@@ -1397,7 +1448,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
           latestReferenceByCommit.set(reference.commitSha, reference.timestamp);
         }
         if (reference.kind === "binding" && retention.pinLabeledEntries && reference.entryId && ledger.labeledEntryIds.has(reference.entryId)) {
-          pinnedCommits.add(reference.commitSha);
+          labeledCommits.add(reference.commitSha);
         }
       }
 
@@ -1422,18 +1473,18 @@ export default function rewindExtension(pi: ExtensionAPI) {
       pendingTreeState?.undoCommitSha,
     ].filter((commitSha): commitSha is string => Boolean(commitSha));
 
-    for (const commitSha of new Set([...currentCommits, ...undoCommits, ...inMemoryCommits])) {
-      if (budgetExceeded()) {
-        notify(ctx, `Rewind retention startup sweep skipped after exceeding ${startupBudgetMs}ms budget`, "warning");
-        return;
-      }
-      if (await commitExists(commitSha)) {
-        pinnedCommits.add(commitSha);
-      }
+    const pinCandidates = [...labeledCommits, ...currentCommits, ...undoCommits, ...inMemoryCommits];
+    // A session of a nested repository (submodule, vendored checkout) passes the cwd filter but
+    // references commits of its own repository; only commits this repository has may count.
+    const existingCommits = await getExistingCommits([...latestReferenceByCommit.keys(), ...pinCandidates]);
+    if (budgetExceeded()) {
+      notify(ctx, `Rewind retention startup sweep skipped after exceeding ${startupBudgetMs}ms budget`, "warning");
+      return;
     }
+    const pinnedCommits = new Set(pinCandidates.filter((commitSha) => existingCommits.has(commitSha)));
 
     let candidates = [...latestReferenceByCommit.entries()]
-      .filter(([commitSha]) => !pinnedCommits.has(commitSha))
+      .filter(([commitSha]) => existingCommits.has(commitSha) && !pinnedCommits.has(commitSha))
       .sort((left, right) => right[1] - left[1]);
 
     if (typeof retention.maxAgeDays === "number" && retention.maxAgeDays >= 0) {
@@ -1445,22 +1496,13 @@ export default function rewindExtension(pi: ExtensionAPI) {
       candidates = candidates.slice(0, retention.maxSnapshots);
     }
 
-    const liveSet = [...new Set([...pinnedCommits, ...candidates.map(([commitSha]) => commitSha)])];
-    const existingLiveSet: string[] = [];
-    for (const commitSha of liveSet) {
-      if (budgetExceeded()) {
-        notify(ctx, `Rewind retention startup sweep skipped after exceeding ${startupBudgetMs}ms budget`, "warning");
-        return;
-      }
-      if (await commitExists(commitSha)) {
-        existingLiveSet.push(commitSha);
-      }
-    }
-
-    const rewriteResult = await rewriteStoreToLiveSet(existingLiveSet);
-    if (rewriteResult === "preserved-empty") {
+    const liveSet = new Set([...pinnedCommits, ...candidates.map(([commitSha]) => commitSha)]);
+    const expiredCommits = new Set([...latestReferenceByCommit.keys()].filter((commitSha) => !liveSet.has(commitSha)));
+    // Nothing to keep or drop: leave the sweep pending so a later one in this session still runs.
+    if (liveSet.size === 0 && expiredCommits.size === 0) {
       return;
     }
+    await rewriteStore([...liveSet], expiredCommits);
 
     // Skip gc on background startup sweeps to avoid racing with concurrent snapshot creation
     if (reason !== "startup") {

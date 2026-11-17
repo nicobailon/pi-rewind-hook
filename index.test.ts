@@ -747,54 +747,126 @@ test("status shows plain text when the host UI has no theme", async () => {
   }
 });
 
-test("retention preserves the keepalive ref when discovery yields an empty live set", async () => {
-  const harness = await createHarness({ settings: { rewind: { retention: { maxSnapshots: 10 } } } });
+test("retention drops expired snapshots even when nothing else stays live", async () => {
+  const harness = await createHarness({ settings: { rewind: { retention: { maxAgeDays: 30 } } } });
 
   try {
-    await harness.writeRepoFile("tracked.txt", "keepalive\n");
-    const snapshotCommit = await harness.captureSnapshot();
-    await harness.updateStoreRef(snapshotCommit);
+    await harness.writeRepoFile("tracked.txt", "expired\n");
+    const expiredCommit = await harness.captureSnapshot();
+    await harness.updateStoreRef(expiredCommit);
+    harness.currentSession.replaceEntries([
+      {
+        type: "custom",
+        id: "rewind-turn-1",
+        parentId: null,
+        timestamp: new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString(),
+        customType: "rewind-turn",
+        data: { v: 2, snapshots: [expiredCommit], bindings: [["user-1", 0]] },
+      },
+    ]);
 
     await harness.invoke("session_start", {});
+    // Shutdown waits for the startup sweep.
+    await harness.invoke("session_shutdown", {});
 
-    assert.equal(await harness.revParseStore(), snapshotCommit);
-    assert.equal(harness.execCalls.some((call) => call[0] === "git" && call[1] === "gc"), false);
+    assert.equal(await harness.revParseStore(), undefined);
   } finally {
     await harness.cleanup();
   }
 });
 
-test("ancestor-only retention discovery ignores unrelated session trees", async () => {
-  const harness = await createHarness({
-    settings: { rewind: { retention: { maxSnapshots: 10, scanMode: "ancestor-only" } } },
-  });
+test("retention keeps snapshots that other sessions of the repository and its linked worktrees pin", async () => {
+  const harness = await createHarness({ settings: { rewind: { retention: { maxAgeDays: 30 } } } });
 
   try {
-    await harness.writeRepoFile("tracked.txt", "stale state\n");
-    const staleCommit = await harness.captureSnapshot();
-    await harness.writeRepoFile("tracked.txt", "unrelated live state\n");
-    const unrelatedLiveCommit = await harness.captureSnapshot();
-    await harness.updateStoreRef(staleCommit);
+    const root = path.dirname(harness.repoRoot);
+    const linkedWorktree = path.join(root, "linked");
+    await runGitChecked(harness.repoRoot, ["commit", "--allow-empty", "-m", "init"]);
+    await runGitChecked(harness.repoRoot, ["worktree", "add", "--detach", linkedWorktree]);
 
-    const unrelatedSession = harness.createSession({
-      id: "session-unrelated",
-      entries: [
-        {
-          type: "custom",
-          id: "rewind-op-1",
-          parentId: null,
-          timestamp: new Date().toISOString(),
-          customType: "rewind-op",
-          data: { v: 2, snapshots: [unrelatedLiveCommit], current: 0 },
-        },
-      ],
-    });
-    unrelatedSession.flush();
+    const commits: Record<string, string> = {};
+    for (const name of ["linked", "unrelated", "outside"]) {
+      await harness.writeRepoFile("tracked.txt", `${name}\n`);
+      commits[name] = await harness.captureSnapshot();
+    }
+    const emptyTree = await gitStdout(harness.repoRoot, ["hash-object", "-t", "tree", "/dev/null"]);
+    await harness.updateStoreRef(await gitStdout(harness.repoRoot, [
+      "commit-tree", emptyTree, "-p", commits.linked, "-p", commits.unrelated, "-p", commits.outside, "-m", "store",
+    ]));
+
+    // The current session's own references to all three expired long ago.
+    harness.currentSession.replaceEntries([
+      {
+        type: "custom",
+        id: "rewind-turn-1",
+        parentId: null,
+        timestamp: new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString(),
+        customType: "rewind-turn",
+        data: { v: 2, snapshots: [commits.linked, commits.unrelated, commits.outside], bindings: [["user-1", 0], ["user-2", 1], ["user-3", 2]] },
+      },
+    ]);
+    const sessionCwds = { linked: linkedWorktree, unrelated: harness.repoRoot, outside: path.join(root, "elsewhere") };
+    for (const [name, cwd] of Object.entries(sessionCwds)) {
+      new SessionManagerStub({
+        sessionFile: path.join(harness.agentDir, "sessions", `--${name}--`, `${name}.jsonl`),
+        id: `session-${name}`,
+        cwd,
+        entries: [{ type: "custom", id: "rewind-op-1", parentId: null, timestamp: new Date().toISOString(), customType: "rewind-op", data: { v: 2, snapshots: [commits[name]], current: 0 } }],
+      });
+    }
 
     await harness.invoke("session_start", {});
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    // Shutdown waits for the startup sweep.
+    await harness.invoke("session_shutdown", {});
 
-    assert.equal(await harness.revParseStore(), staleCommit);
+    const storeHead = await harness.revParseStore();
+    assert.ok(storeHead);
+    assert.equal(await harness.isAncestor(commits.linked, storeHead), true);
+    assert.equal(await harness.isAncestor(commits.unrelated, storeHead), true);
+    assert.equal(await harness.isAncestor(commits.outside, storeHead), false);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("retention ignores commits of a nested repository when applying maxSnapshots", async () => {
+  const harness = await createHarness({ settings: { rewind: { retention: { maxSnapshots: 2 } } } });
+
+  try {
+    await harness.writeRepoFile("tracked.txt", "kept\n");
+    const keptCommit = await harness.captureSnapshot();
+    await harness.updateStoreRef(keptCommit);
+    const nestedRepo = path.join(harness.repoRoot, "nested");
+    await runGitChecked(harness.repoRoot, ["init", "-q", nestedRepo]);
+    const nestedTree = await gitStdout(nestedRepo, ["hash-object", "-w", "-t", "tree", "/dev/null"]);
+    const nestedCommits: string[] = [];
+    for (const message of ["one", "two"]) {
+      nestedCommits.push(await gitStdout(nestedRepo, ["-c", "user.name=t", "-c", "user.email=t@example.com", "commit-tree", nestedTree, "-m", message]));
+    }
+
+    const rewindTurn = (snapshots: string[], ageMs: number) => ({
+      type: "custom",
+      id: "rewind-turn-1",
+      parentId: null,
+      timestamp: new Date(Date.now() - ageMs).toISOString(),
+      customType: "rewind-turn",
+      data: { v: 2, snapshots, bindings: snapshots.map((_, index) => [`user-${index}`, index]) },
+    });
+    harness.currentSession.replaceEntries([rewindTurn([keptCommit], 60_000)]);
+    new SessionManagerStub({
+      sessionFile: path.join(harness.agentDir, "sessions", "--nested--", "nested.jsonl"),
+      id: "session-nested",
+      cwd: nestedRepo,
+      entries: [rewindTurn(nestedCommits, 0)],
+    });
+
+    await harness.invoke("session_start", {});
+    // Shutdown waits for the startup sweep.
+    await harness.invoke("session_shutdown", {});
+
+    const storeHead = await harness.revParseStore();
+    assert.ok(storeHead);
+    assert.equal(await harness.isAncestor(keptCommit, storeHead), true);
   } finally {
     await harness.cleanup();
   }
@@ -803,9 +875,8 @@ test("ancestor-only retention discovery ignores unrelated session trees", async 
 test("session shutdown waits for an in-flight startup retention sweep", async () => {
   const harness = await createHarness({
     settings: { rewind: { retention: { maxSnapshots: 10 } } },
-    // The first check reconstructs the active rewind state; the second is the
-    // detached startup sweep that a session replacement must join.
-    pauseGitSubcommand: { name: "cat-file", occurrence: 2 },
+    // The detached startup sweep, which a session replacement must join, starts by listing worktrees.
+    pauseGitSubcommand: { name: "worktree", occurrence: 1 },
   });
   let paused = false;
 
@@ -984,6 +1055,41 @@ test("a startup retention sweep keeps the snapshot a resumed session reuses for 
     assert.ok(storeHead && storeHead !== reusedCommit, "the startup sweep did not run");
     assert.equal(await harness.isAncestor(labeledCommit, storeHead), true);
     assert.equal(await harness.isAncestor(reusedCommit, storeHead), true);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("a retention sweep drops only the snapshots it read and expired", async () => {
+  const harness = await createHarness({ settings: { rewind: { retention: { maxAgeDays: 30 } } } });
+
+  try {
+    await harness.writeRepoFile("tracked.txt", "expired\n");
+    const expiredCommit = await harness.captureSnapshot();
+    await harness.writeRepoFile("tracked.txt", "live\n");
+    const liveCommit = await harness.captureSnapshot();
+    await harness.writeRepoFile("tracked.txt", "unread\n");
+    const unreadCommit = await harness.captureSnapshot();
+    const emptyTree = await gitStdout(harness.repoRoot, ["hash-object", "-t", "tree", "/dev/null"]);
+    await harness.updateStoreRef(await gitStdout(harness.repoRoot, [
+      "commit-tree", emptyTree, "-p", expiredCommit, "-p", liveCommit, "-p", unreadCommit, "-m", "store",
+    ]));
+
+    const fortyDaysAgo = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString();
+    harness.currentSession.replaceEntries([
+      { type: "custom", id: "rewind-turn-1", parentId: null, timestamp: fortyDaysAgo, customType: "rewind-turn", data: { v: 2, snapshots: [expiredCommit], bindings: [["user-1", 0]] } },
+      { type: "custom", id: "rewind-op-2", parentId: "rewind-turn-1", timestamp: new Date().toISOString(), customType: "rewind-op", data: { v: 2, snapshots: [liveCommit], current: 0 } },
+    ]);
+
+    await harness.invoke("session_start", {});
+    // Shutdown waits for the startup sweep.
+    await harness.invoke("session_shutdown", {});
+
+    const storeHead = await harness.revParseStore();
+    assert.ok(storeHead);
+    assert.equal(await harness.isAncestor(liveCommit, storeHead), true);
+    assert.equal(await harness.isAncestor(unreadCommit, storeHead), true);
+    assert.equal(await harness.isAncestor(expiredCommit, storeHead), false);
   } finally {
     await harness.cleanup();
   }
