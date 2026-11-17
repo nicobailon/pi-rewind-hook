@@ -880,7 +880,13 @@ export default function rewindExtension(pi: ExtensionAPI) {
     throw new Error(`failed to update rewind store ref: ${detail}`);
   }
 
-  async function rewriteStoreToLiveSet(liveCommitShas: string[]): Promise<"rewritten" | "preserved-empty"> {
+  async function getStoreSnapshots(storeHead: string): Promise<string[]> {
+    // Snapshots are root commits; keepalive commits always have parents.
+    const result = await execGitChecked(["rev-list", "--max-parents=0", storeHead]);
+    return result.stdout.split("\n").filter(Boolean);
+  }
+
+  async function rewriteStore(liveCommitShas: string[], expiredCommitShas: Set<string>): Promise<"rewritten" | "unchanged" | "preserved-empty"> {
     const uniqueLiveCommits = [...new Set(liveCommitShas.filter(Boolean))];
     if (uniqueLiveCommits.length === 0) {
       return "preserved-empty";
@@ -888,16 +894,22 @@ export default function rewindExtension(pi: ExtensionAPI) {
 
     let attempts = 0;
     let lastError: unknown;
-    let preserveConcurrentHead = false;
 
     while (attempts < 5) {
       attempts += 1;
       const oldHead = await getStoreHead();
-      // A failed compare-and-swap means another session added snapshots while
-      // this sweep was running. Preserve that new reachability and let a later
-      // uncontended sweep prune anything no longer retained.
-      let head = preserveConcurrentHead ? oldHead : undefined;
-      for (const commitSha of uniqueLiveCommits) {
+      // Other sessions share the store, so only drop snapshots this sweep read and expired.
+      // Members are re-read from the head the compare-and-swap uses, which keeps concurrent appends.
+      const members = oldHead ? await getStoreSnapshots(oldHead) : [];
+      const memberSet = new Set(members);
+      const kept = members.filter((commitSha) => !expiredCommitShas.has(commitSha));
+      const added = uniqueLiveCommits.filter((commitSha) => !memberSet.has(commitSha));
+      if (kept.length === members.length && added.length === 0) {
+        return "unchanged";
+      }
+
+      let head: string | undefined;
+      for (const commitSha of [...kept, ...added]) {
         head = await createStoreKeepaliveCommit(commitSha, head);
       }
 
@@ -912,7 +924,6 @@ export default function rewindExtension(pi: ExtensionAPI) {
         // Retry if another process updated the store ref concurrently.
         // Keep the most recent error for actionable failure context.
         lastError = error;
-        preserveConcurrentHead = true;
       }
     }
 
@@ -1457,7 +1468,9 @@ export default function rewindExtension(pi: ExtensionAPI) {
       }
     }
 
-    const rewriteResult = await rewriteStoreToLiveSet(existingLiveSet);
+    const liveCommits = new Set(liveSet);
+    const expiredCommits = new Set([...latestReferenceByCommit.keys()].filter((commitSha) => !liveCommits.has(commitSha)));
+    const rewriteResult = await rewriteStore(existingLiveSet, expiredCommits);
     if (rewriteResult === "preserved-empty") {
       return;
     }
