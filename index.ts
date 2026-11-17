@@ -444,11 +444,10 @@ export default function rewindExtension(pi: ExtensionAPI) {
     }
 
     const uniqueSnapshots = new Set(entryToCommit.values()).size;
-    const theme = ctx.ui.theme;
-    ctx.ui.setStatus(
-      STATUS_KEY,
-      theme.fg("dim", "◆ ") + theme.fg("muted", `${entryToCommit.size} points / ${uniqueSnapshots} snapshots`),
-    );
+    const label = `${entryToCommit.size} points / ${uniqueSnapshots} snapshots`;
+    // Hosts that spread a UI context whose `theme` is a prototype getter hand us no theme (#24).
+    const theme = ctx.ui.theme as typeof ctx.ui.theme | undefined;
+    ctx.ui.setStatus(STATUS_KEY, theme ? theme.fg("dim", "◆ ") + theme.fg("muted", label) : `◆ ${label}`);
   }
 
   function resetState() {
