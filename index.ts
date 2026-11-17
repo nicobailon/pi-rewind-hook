@@ -859,7 +859,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
 
   async function getExistingCommits(commitShas: string[]): Promise<Set<string>> {
     // Only full object names: a ledger value with a space or newline would make the batch output ambiguous.
-    const names = [...new Set(commitShas)].filter((commitSha) => /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(commitSha));
+    const names = commitShas.filter((commitSha) => /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(commitSha));
     if (names.length === 0) return new Set();
     // One process for the whole batch; pi.exec has no stdin.
     const check = execAsync("git cat-file --batch-check", { cwd: await getRepoRoot(pi.exec), maxBuffer: LIST_MAX_BUFFER });
@@ -1327,8 +1327,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
     }
   }
 
-  // Every worktree of a repository shares refs/pi-rewind/store, so a sweep reads
-  // every session whose cwd sits in any of them, not just the current lineage.
+  // Every worktree of a repository shares refs/pi-rewind/store, so a sweep reads the sessions of all of them.
   async function discoverSessionFiles(isInsideRepo: (cwd: string) => boolean): Promise<string[]> {
     const discovered = new Set<string>();
 
@@ -1427,6 +1426,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
 
       const ledger = sessionFile === currentSessionFile ? buildCurrentSessionLedger(ctx) : await parseSessionLedgerFile(sessionFile);
       if (!ledger?.cwd) continue;
+      // parentSession ancestors skip discovery's header filter.
       if (!isInsideRepo(ledger.cwd)) continue;
       ledgers.push(ledger);
     }

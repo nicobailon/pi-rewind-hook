@@ -1082,7 +1082,7 @@ test("a retention sweep drops only the snapshots it read and expired", async () 
     ]);
 
     await harness.invoke("session_start", {});
-    // Shutdown joins the startup sweep.
+    // Shutdown waits for the startup sweep.
     await harness.invoke("session_shutdown", {});
 
     const storeHead = await harness.revParseStore();
