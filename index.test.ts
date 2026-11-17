@@ -191,6 +191,7 @@ async function createHarness(options: {
   settings?: Record<string, unknown>;
   failGitSubcommands?: string[];
   pauseGitSubcommand?: { name: string; occurrence: number };
+  omitTheme?: boolean;
 } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "rewind-ext-test-"));
   const repoRoot = path.join(root, "repo");
@@ -291,7 +292,7 @@ async function createHarness(options: {
           selectCalls.push({ title, options: choices });
           return pendingSelections.shift();
         },
-        theme: {
+        theme: options.omitTheme ? undefined : {
           fg: (_color: string, text: string) => text,
         },
       },
@@ -729,6 +730,18 @@ test("startup does not touch the keepalive ref when rewind.retention is omitted"
     assert.equal(await harness.revParseStore(), snapshotCommit);
     assert.equal(harness.execCalls.some((call) => call[0] === "git" && call[1] === "gc"), false);
     assert.equal(harness.execCalls.some((call) => call[0] === "git" && call[1] === "update-ref" && call.includes(STORE_REF)), false);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("status shows plain text when the host UI has no theme", async () => {
+  const harness = await createHarness({ omitTheme: true });
+
+  try {
+    await harness.invoke("session_start", {});
+
+    assert.equal(harness.statusUpdates.at(-1)?.value, "◆ 0 points / 0 snapshots");
   } finally {
     await harness.cleanup();
   }

@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Rewind no longer shows a "failed to finalize rewind turn" warning after every prompt and session switch in hosts whose UI has no theme, such as pi-web-ui. The status line falls back to plain text. Thanks to [@wu546526](https://github.com/wu546526) for reporting and diagnosing #24.
+
 ## [1.8.8] - 2026-10-31
 
 ### Highlights
