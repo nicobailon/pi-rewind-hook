@@ -7,7 +7,10 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - Rewind no longer shows a "failed to finalize rewind turn" warning after every prompt and session switch in hosts whose UI has no theme, such as pi-web-ui. The status line falls back to plain text. Thanks to [@wu546526](https://github.com/wu546526) for reporting and diagnosing #24.
 - Resuming a session whose files haven't changed keeps the restore point of its next prompt when retention is on. Before, the startup retention sweep could drop that snapshot and `git gc` could then delete it. Thanks to [@w-winter](https://github.com/w-winter) for reporting and diagnosing #26.
-- Retention sweeps no longer drop snapshots that other sessions in the same repository still use. Before, each sweep kept only the snapshots of the sessions it read, so the next `git gc` could delete the restore points of every other session. A sweep now only removes snapshots it read and found expired. Thanks to [@w-winter](https://github.com/w-winter) for reporting and diagnosing #25.
+- Retention sweeps no longer drop snapshots that other sessions in the same repository still use, including forked sessions and sessions started in a linked worktree. Before, each sweep read only the current session and its parents and kept just their snapshots, so the next `git gc` could delete the restore points of every other session. A sweep now reads every session of the repository and only removes snapshots it read and found expired. Thanks to [@w-winter](https://github.com/w-winter) for reporting and diagnosing #25.
+
+### Removed
+- `rewind.retention.scanMode` is removed. Every retention sweep now reads all sessions of the repository, including sessions in its linked worktrees.
 
 ## [1.8.8] - 2026-10-31
 

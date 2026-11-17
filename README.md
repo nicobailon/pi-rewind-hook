@@ -64,7 +64,6 @@ Optionally add settings to `~/.pi/agent/settings.json`.  For example:
 - `rewind.retention.maxSnapshots` — optional cap on unpinned unique snapshot commits kept reachable
 - `rewind.retention.maxAgeDays` — optional age limit for unpinned snapshot commits
 - `rewind.retention.pinLabeledEntries` — when true, snapshot commits bound to **labeled nodes** in the Pi session tree are exempt from `maxSnapshots` and `maxAgeDays` pruning (useful for bookmarking important rewind points you want to prevent getting garbage-collected)
-- `rewind.retention.scanMode` — retention discovery mode: `ancestor-only` (default, follow current session lineage only) or `repo-sessions` (scan discovered session roots)
 - `rewind.retention.startupBudgetMs` — optional startup time budget for retention sweeps; if exceeded, startup sweep is skipped and deferred
 
 If `rewind.retention` is omitted, Rewind keeps exact history with no automatic expiration. This can grow git object storage without bound over time.
@@ -200,7 +199,7 @@ Rewind v2 uses only session-native `rewind-turn`/`rewind-op` metadata and does n
 
 Retention only affects git reachability. Session JSONL metadata is append-only and is never compacted by Rewind.
 
-When retention is enabled, Rewind keeps snapshot commits alive if they are referenced by:
+When retention is enabled, each sweep reads every Pi session of the repository, including sessions started in its linked worktrees and the current session's `parentSession` ancestors. Rewind keeps snapshot commits alive if they are referenced by:
 
 - a `rewind-turn` or `rewind-op` binding in a discovered same-repo session
 - the latest `rewind-op.current` for a discovered same-repo session
@@ -244,5 +243,5 @@ grep '"customType":"rewind-' ~/.pi/agent/sessions/**/*.jsonl
 - Only works in git repositories
 - Submodule snapshots contain gitlink commits, not uncommitted nested files; unsupported submodule states are refused instead of reported as exact restores
 - Session metadata grows append-only; retention only trims git reachability
-- Discovery for retention is best-effort across discovered Pi session roots and explicit `parentSession` ancestors
+- Retention discovery is best-effort: it reads sessions under the default Pi sessions directory and the current session's directory, plus explicit `parentSession` ancestors
 - Ignored files and empty directories are outside the snapshot model

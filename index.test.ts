@@ -775,37 +775,55 @@ test("retention drops expired snapshots even when nothing else stays live", asyn
   }
 });
 
-test("ancestor-only retention discovery ignores unrelated session trees", async () => {
-  const harness = await createHarness({
-    settings: { rewind: { retention: { maxSnapshots: 10, scanMode: "ancestor-only" } } },
-  });
+test("retention keeps snapshots that other sessions of the repository and its linked worktrees pin", async () => {
+  const harness = await createHarness({ settings: { rewind: { retention: { maxAgeDays: 30 } } } });
 
   try {
-    await harness.writeRepoFile("tracked.txt", "stale state\n");
-    const staleCommit = await harness.captureSnapshot();
-    await harness.writeRepoFile("tracked.txt", "unrelated live state\n");
-    const unrelatedLiveCommit = await harness.captureSnapshot();
-    await harness.updateStoreRef(staleCommit);
+    const root = path.dirname(harness.repoRoot);
+    const linkedWorktree = path.join(root, "linked");
+    await runGitChecked(harness.repoRoot, ["commit", "--allow-empty", "-m", "init"]);
+    await runGitChecked(harness.repoRoot, ["worktree", "add", "--detach", linkedWorktree]);
 
-    const unrelatedSession = harness.createSession({
-      id: "session-unrelated",
-      entries: [
-        {
-          type: "custom",
-          id: "rewind-op-1",
-          parentId: null,
-          timestamp: new Date().toISOString(),
-          customType: "rewind-op",
-          data: { v: 2, snapshots: [unrelatedLiveCommit], current: 0 },
-        },
-      ],
-    });
-    unrelatedSession.flush();
+    const commits: Record<string, string> = {};
+    for (const name of ["linked", "unrelated", "outside"]) {
+      await harness.writeRepoFile("tracked.txt", `${name}\n`);
+      commits[name] = await harness.captureSnapshot();
+    }
+    const emptyTree = await gitStdout(harness.repoRoot, ["hash-object", "-t", "tree", "/dev/null"]);
+    await harness.updateStoreRef(await gitStdout(harness.repoRoot, [
+      "commit-tree", emptyTree, "-p", commits.linked, "-p", commits.unrelated, "-p", commits.outside, "-m", "store",
+    ]));
+
+    // The current session's own references to all three expired long ago.
+    harness.currentSession.replaceEntries([
+      {
+        type: "custom",
+        id: "rewind-turn-1",
+        parentId: null,
+        timestamp: new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString(),
+        customType: "rewind-turn",
+        data: { v: 2, snapshots: [commits.linked, commits.unrelated, commits.outside], bindings: [["user-1", 0], ["user-2", 1], ["user-3", 2]] },
+      },
+    ]);
+    const sessionCwds = { linked: linkedWorktree, unrelated: harness.repoRoot, outside: path.join(root, "elsewhere") };
+    for (const [name, cwd] of Object.entries(sessionCwds)) {
+      new SessionManagerStub({
+        sessionFile: path.join(harness.agentDir, "sessions", `--${name}--`, `${name}.jsonl`),
+        id: `session-${name}`,
+        cwd,
+        entries: [{ type: "custom", id: "rewind-op-1", parentId: null, timestamp: new Date().toISOString(), customType: "rewind-op", data: { v: 2, snapshots: [commits[name]], current: 0 } }],
+      });
+    }
 
     await harness.invoke("session_start", {});
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    // Shutdown waits for the startup sweep.
+    await harness.invoke("session_shutdown", {});
 
-    assert.equal(await harness.revParseStore(), staleCommit);
+    const storeHead = await harness.revParseStore();
+    assert.ok(storeHead);
+    assert.equal(await harness.isAncestor(commits.linked, storeHead), true);
+    assert.equal(await harness.isAncestor(commits.unrelated, storeHead), true);
+    assert.equal(await harness.isAncestor(commits.outside, storeHead), false);
   } finally {
     await harness.cleanup();
   }

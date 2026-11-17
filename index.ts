@@ -1,7 +1,7 @@
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { exec as execCb } from "child_process";
 import { existsSync, readFileSync, realpathSync } from "fs";
-import { lstat, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "fs/promises";
+import { lstat, mkdtemp, open, readdir, readFile, rm, stat, utimes, writeFile } from "fs/promises";
 import { homedir, tmpdir } from "os";
 import { dirname, isAbsolute, join, relative, resolve } from "path";
 import { promisify } from "util";
@@ -41,7 +41,6 @@ interface RewindSettings {
       maxSnapshots?: number;
       maxAgeDays?: number;
       pinLabeledEntries?: boolean;
-      scanMode?: "ancestor-only" | "repo-sessions";
       startupBudgetMs?: number;
     };
   };
@@ -224,10 +223,6 @@ function getRetentionSettings(): RewindRetentionSettings | undefined {
   return getSettings().rewind?.retention;
 }
 
-function getRetentionScanMode(): "ancestor-only" | "repo-sessions" {
-  return getRetentionSettings()?.scanMode === "repo-sessions" ? "repo-sessions" : "ancestor-only";
-}
-
 function getStartupSweepBudgetMs(): number | undefined {
   const value = getRetentionSettings()?.startupBudgetMs;
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
@@ -269,6 +264,34 @@ function isInsidePath(targetPath: string, parentPath: string): boolean {
   const resolvedParent = canonicalizePath(parentPath);
   const rel = relative(resolvedParent, resolvedTarget);
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+const SESSION_HEADER_READ_BYTES = 16 * 1024;
+
+async function readSessionHeaderCwd(sessionFile: string): Promise<string | undefined> {
+  let text: string;
+  try {
+    const file = await open(sessionFile, "r");
+    try {
+      const buffer = Buffer.alloc(SESSION_HEADER_READ_BYTES);
+      const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+      text = buffer.toString("utf-8", 0, bytesRead);
+    } finally {
+      await file.close();
+    }
+  } catch {
+    // Skip unreadable session files during best-effort discovery.
+    return undefined;
+  }
+
+  const newline = text.indexOf("\n");
+  try {
+    const header = JSON.parse(newline >= 0 ? text.slice(0, newline) : text);
+    return header?.type === "session" && typeof header.cwd === "string" ? header.cwd : undefined;
+  } catch {
+    // Ignore files whose first line is not a session header.
+    return undefined;
+  }
 }
 
 function toTimestamp(value: string | undefined): number {
@@ -1295,41 +1318,52 @@ export default function rewindExtension(pi: ExtensionAPI) {
     }
   }
 
-  async function discoverSessionFiles(scanMode: "ancestor-only" | "repo-sessions"): Promise<string[]> {
+  async function getWorktreePaths(): Promise<string[]> {
+    const result = await execGitChecked(["worktree", "list", "--porcelain"]);
+    return result.stdout
+      .split("\n")
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => line.slice("worktree ".length));
+  }
+
+  // Every worktree of a repository shares refs/pi-rewind/store, so a sweep reads
+  // every session whose cwd sits in any of them, not just the current lineage.
+  async function discoverSessionFiles(isInsideRepo: (cwd: string) => boolean): Promise<string[]> {
     const discovered = new Set<string>();
 
-    if (scanMode === "repo-sessions") {
-      const roots = new Set<string>();
-      const defaultSessionsDir = getDefaultSessionsDir();
-      if (existsSync(defaultSessionsDir)) {
-        roots.add(defaultSessionsDir);
-      }
-      if (currentSessionFile) {
-        roots.add(dirname(currentSessionFile));
+    const roots = new Set<string>();
+    const defaultSessionsDir = getDefaultSessionsDir();
+    if (existsSync(defaultSessionsDir)) {
+      roots.add(defaultSessionsDir);
+    }
+    if (currentSessionFile) {
+      roots.add(dirname(currentSessionFile));
+    }
+
+    const stack = [...roots];
+    while (stack.length > 0) {
+      const dir = stack.pop();
+      if (!dir) continue;
+
+      let entries: Awaited<ReturnType<typeof readdir>>;
+      try {
+        entries = await readdir(dir, { withFileTypes: true });
+      } catch {
+        // Skip unreadable directories during best-effort discovery.
+        continue;
       }
 
-      const stack = [...roots];
-      while (stack.length > 0) {
-        const dir = stack.pop();
-        if (!dir) continue;
-
-        let entries: Awaited<ReturnType<typeof readdir>>;
-        try {
-          entries = await readdir(dir, { withFileTypes: true });
-        } catch {
-          // Skip unreadable directories during best-effort discovery.
+      for (const entry of entries) {
+        const fullPath = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          stack.push(fullPath);
           continue;
         }
-
-        for (const entry of entries) {
-          const fullPath = join(dir, entry.name);
-          if (entry.isDirectory()) {
-            stack.push(fullPath);
-            continue;
-          }
-          if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-            discovered.add(fullPath);
-          }
+        if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+        // Read only the header first; most sessions belong to other repositories.
+        const cwd = await readSessionHeaderCwd(fullPath);
+        if (cwd && isInsideRepo(cwd)) {
+          discovered.add(fullPath);
         }
       }
     }
@@ -1363,13 +1397,14 @@ export default function rewindExtension(pi: ExtensionAPI) {
     const retention = getRetentionSettings();
     if (!retention) return;
 
-    const scanMode = getRetentionScanMode();
     const startupBudgetMs = reason === "startup" ? getStartupSweepBudgetMs() : undefined;
     const startedAt = Date.now();
 
     const budgetExceeded = () => typeof startupBudgetMs === "number" && Date.now() - startedAt > startupBudgetMs;
 
-    const sessionFiles = await discoverSessionFiles(scanMode);
+    const worktreePaths = await getWorktreePaths();
+    const isInsideRepo = (cwd: string) => worktreePaths.some((worktreePath) => isInsidePath(cwd, worktreePath));
+    const sessionFiles = await discoverSessionFiles(isInsideRepo);
     if (budgetExceeded()) {
       notify(ctx, `Rewind retention startup sweep skipped after exceeding ${startupBudgetMs}ms budget`, "warning");
       return;
@@ -1385,7 +1420,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
 
       const ledger = sessionFile === currentSessionFile ? buildCurrentSessionLedger(ctx) : await parseSessionLedgerFile(sessionFile);
       if (!ledger?.cwd) continue;
-      if (!isInsidePath(ledger.cwd, repoRoot)) continue;
+      if (!isInsideRepo(ledger.cwd)) continue;
       ledgers.push(ledger);
     }
 
