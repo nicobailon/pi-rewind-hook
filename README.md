@@ -209,7 +209,7 @@ When retention is enabled, Rewind keeps snapshot commits alive if they are refer
 
 If a snapshot commit has been pruned, Rewind validates commit existence before offering restore.
 
-If retention discovery yields an empty live set, Rewind preserves the existing `refs/pi-rewind/store` ref rather than deleting it.
+A sweep only removes snapshots that it read in a discovered session and found expired. Snapshots of sessions the sweep didn't read stay in `refs/pi-rewind/store`.
 
 ## Viewing storage
 

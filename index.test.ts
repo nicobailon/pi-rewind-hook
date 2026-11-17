@@ -747,18 +747,29 @@ test("status shows plain text when the host UI has no theme", async () => {
   }
 });
 
-test("retention preserves the keepalive ref when discovery yields an empty live set", async () => {
-  const harness = await createHarness({ settings: { rewind: { retention: { maxSnapshots: 10 } } } });
+test("retention drops expired snapshots even when nothing else stays live", async () => {
+  const harness = await createHarness({ settings: { rewind: { retention: { maxAgeDays: 30 } } } });
 
   try {
-    await harness.writeRepoFile("tracked.txt", "keepalive\n");
-    const snapshotCommit = await harness.captureSnapshot();
-    await harness.updateStoreRef(snapshotCommit);
+    await harness.writeRepoFile("tracked.txt", "expired\n");
+    const expiredCommit = await harness.captureSnapshot();
+    await harness.updateStoreRef(expiredCommit);
+    harness.currentSession.replaceEntries([
+      {
+        type: "custom",
+        id: "rewind-turn-1",
+        parentId: null,
+        timestamp: new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString(),
+        customType: "rewind-turn",
+        data: { v: 2, snapshots: [expiredCommit], bindings: [["user-1", 0]] },
+      },
+    ]);
 
     await harness.invoke("session_start", {});
+    // Shutdown waits for the startup sweep.
+    await harness.invoke("session_shutdown", {});
 
-    assert.equal(await harness.revParseStore(), snapshotCommit);
-    assert.equal(harness.execCalls.some((call) => call[0] === "git" && call[1] === "gc"), false);
+    assert.equal(await harness.revParseStore(), undefined);
   } finally {
     await harness.cleanup();
   }

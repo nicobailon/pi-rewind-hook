@@ -886,12 +886,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
     return result.stdout.split("\n").filter(Boolean);
   }
 
-  async function rewriteStore(liveCommitShas: string[], expiredCommitShas: Set<string>): Promise<"rewritten" | "unchanged" | "preserved-empty"> {
-    const uniqueLiveCommits = [...new Set(liveCommitShas.filter(Boolean))];
-    if (uniqueLiveCommits.length === 0) {
-      return "preserved-empty";
-    }
-
+  async function rewriteStore(liveCommitShas: string[], expiredCommitShas: Set<string>): Promise<void> {
     let attempts = 0;
     let lastError: unknown;
 
@@ -903,9 +898,9 @@ export default function rewindExtension(pi: ExtensionAPI) {
       const members = oldHead ? await getStoreSnapshots(oldHead) : [];
       const memberSet = new Set(members);
       const kept = members.filter((commitSha) => !expiredCommitShas.has(commitSha));
-      const added = uniqueLiveCommits.filter((commitSha) => !memberSet.has(commitSha));
+      const added = liveCommitShas.filter((commitSha) => !memberSet.has(commitSha));
       if (kept.length === members.length && added.length === 0) {
-        return "unchanged";
+        return;
       }
 
       let head: string | undefined;
@@ -914,12 +909,15 @@ export default function rewindExtension(pi: ExtensionAPI) {
       }
 
       try {
-        if (oldHead) {
-          await execGitChecked(["update-ref", STORE_REF, head!, oldHead]);
+        if (!head) {
+          // Every member expired, so nothing is left to keep alive.
+          await execGitChecked(["update-ref", "-d", STORE_REF, oldHead!]);
+        } else if (oldHead) {
+          await execGitChecked(["update-ref", STORE_REF, head, oldHead]);
         } else {
-          await execGitChecked(["update-ref", STORE_REF, head!, LEGACY_ZERO_SHA]);
+          await execGitChecked(["update-ref", STORE_REF, head, LEGACY_ZERO_SHA]);
         }
-        return "rewritten";
+        return;
       } catch (error) {
         // Retry if another process updated the store ref concurrently.
         // Keep the most recent error for actionable failure context.
@@ -1456,7 +1454,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
       candidates = candidates.slice(0, retention.maxSnapshots);
     }
 
-    const liveSet = [...new Set([...pinnedCommits, ...candidates.map(([commitSha]) => commitSha)])];
+    const liveSet = new Set([...pinnedCommits, ...candidates.map(([commitSha]) => commitSha)]);
     const existingLiveSet: string[] = [];
     for (const commitSha of liveSet) {
       if (budgetExceeded()) {
@@ -1468,12 +1466,12 @@ export default function rewindExtension(pi: ExtensionAPI) {
       }
     }
 
-    const liveCommits = new Set(liveSet);
-    const expiredCommits = new Set([...latestReferenceByCommit.keys()].filter((commitSha) => !liveCommits.has(commitSha)));
-    const rewriteResult = await rewriteStore(existingLiveSet, expiredCommits);
-    if (rewriteResult === "preserved-empty") {
+    const expiredCommits = new Set([...latestReferenceByCommit.keys()].filter((commitSha) => !liveSet.has(commitSha)));
+    // Nothing to keep or drop: leave the sweep pending so a later one in this session still runs.
+    if (liveSet.size === 0 && expiredCommits.size === 0) {
       return;
     }
+    await rewriteStore(existingLiveSet, expiredCommits);
 
     // Skip gc on background startup sweeps to avoid racing with concurrent snapshot creation
     if (reason !== "startup") {
