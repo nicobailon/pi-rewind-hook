@@ -1409,7 +1409,20 @@ export default function rewindExtension(pi: ExtensionAPI) {
       }
     }
 
-    for (const commitSha of [...currentCommits, ...undoCommits]) {
+    // This session can bind or restore these next without writing them first: a
+    // resumed session reuses lastExact for its next prompt. Sweeps in later sessions
+    // only see what is written, so the pins end with this session.
+    const inMemoryCommits = [
+      lastExact?.commitSha,
+      activeBranchState.currentCommitSha,
+      activeBranchState.undoCommitSha,
+      promptCollector?.pendingUserCommitSha,
+      ...(promptCollector?.snapshots ?? []),
+      pendingTreeState?.currentCommitSha,
+      pendingTreeState?.undoCommitSha,
+    ].filter((commitSha): commitSha is string => Boolean(commitSha));
+
+    for (const commitSha of new Set([...currentCommits, ...undoCommits, ...inMemoryCommits])) {
       if (budgetExceeded()) {
         notify(ctx, `Rewind retention startup sweep skipped after exceeding ${startupBudgetMs}ms budget`, "warning");
         return;
