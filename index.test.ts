@@ -829,12 +829,54 @@ test("retention keeps snapshots that other sessions of the repository and its li
   }
 });
 
+test("retention ignores commits of a nested repository when applying maxSnapshots", async () => {
+  const harness = await createHarness({ settings: { rewind: { retention: { maxSnapshots: 2 } } } });
+
+  try {
+    await harness.writeRepoFile("tracked.txt", "kept\n");
+    const keptCommit = await harness.captureSnapshot();
+    await harness.updateStoreRef(keptCommit);
+    const nestedRepo = path.join(harness.repoRoot, "nested");
+    await runGitChecked(harness.repoRoot, ["init", "-q", nestedRepo]);
+    const nestedTree = await gitStdout(nestedRepo, ["hash-object", "-w", "-t", "tree", "/dev/null"]);
+    const nestedCommits: string[] = [];
+    for (const message of ["one", "two"]) {
+      nestedCommits.push(await gitStdout(nestedRepo, ["-c", "user.name=t", "-c", "user.email=t@example.com", "commit-tree", nestedTree, "-m", message]));
+    }
+
+    const rewindTurn = (snapshots: string[], ageMs: number) => ({
+      type: "custom",
+      id: "rewind-turn-1",
+      parentId: null,
+      timestamp: new Date(Date.now() - ageMs).toISOString(),
+      customType: "rewind-turn",
+      data: { v: 2, snapshots, bindings: snapshots.map((_, index) => [`user-${index}`, index]) },
+    });
+    harness.currentSession.replaceEntries([rewindTurn([keptCommit], 60_000)]);
+    new SessionManagerStub({
+      sessionFile: path.join(harness.agentDir, "sessions", "--nested--", "nested.jsonl"),
+      id: "session-nested",
+      cwd: nestedRepo,
+      entries: [rewindTurn(nestedCommits, 0)],
+    });
+
+    await harness.invoke("session_start", {});
+    // Shutdown waits for the startup sweep.
+    await harness.invoke("session_shutdown", {});
+
+    const storeHead = await harness.revParseStore();
+    assert.ok(storeHead);
+    assert.equal(await harness.isAncestor(keptCommit, storeHead), true);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("session shutdown waits for an in-flight startup retention sweep", async () => {
   const harness = await createHarness({
     settings: { rewind: { retention: { maxSnapshots: 10 } } },
-    // The first check reconstructs the active rewind state; the second is the
-    // detached startup sweep that a session replacement must join.
-    pauseGitSubcommand: { name: "cat-file", occurrence: 2 },
+    // The detached startup sweep, which a session replacement must join, starts by listing worktrees.
+    pauseGitSubcommand: { name: "worktree", occurrence: 1 },
   });
   let paused = false;
 

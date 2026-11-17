@@ -855,6 +855,18 @@ export default function rewindExtension(pi: ExtensionAPI) {
     return result.code === 0;
   }
 
+  async function getExistingCommits(commitShas: string[]): Promise<Set<string>> {
+    // Only full object names: a ledger value with a space or newline would make the batch output ambiguous.
+    const names = [...new Set(commitShas)].filter((commitSha) => /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(commitSha));
+    if (names.length === 0) return new Set();
+    // One process for the whole batch; pi.exec has no stdin.
+    const check = execAsync("git cat-file --batch-check", { cwd: await getRepoRoot(pi.exec), maxBuffer: LIST_MAX_BUFFER });
+    check.child.stdin?.end(names.map((name) => `${name}\n`).join(""));
+    const { stdout } = await check;
+    // Lines are "<sha> <type> <size>", or "<sha> missing".
+    return new Set(stdout.split("\n").map((line) => line.split(" ")).filter(([, type]) => type === "commit").map(([commitSha]) => commitSha));
+  }
+
   async function getStoreHead(): Promise<string | undefined> {
     const result = await pi.exec("git", ["rev-parse", "--verify", STORE_REF]);
     if (result.code !== 0) {
@@ -1425,7 +1437,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
     }
 
     const latestReferenceByCommit = new Map<string, number>();
-    const pinnedCommits = new Set<string>();
+    const labeledCommits = new Set<string>();
     const currentCommits = new Set<string>();
     const undoCommits = new Set<string>();
 
@@ -1441,7 +1453,7 @@ export default function rewindExtension(pi: ExtensionAPI) {
           latestReferenceByCommit.set(reference.commitSha, reference.timestamp);
         }
         if (reference.kind === "binding" && retention.pinLabeledEntries && reference.entryId && ledger.labeledEntryIds.has(reference.entryId)) {
-          pinnedCommits.add(reference.commitSha);
+          labeledCommits.add(reference.commitSha);
         }
       }
 
@@ -1466,18 +1478,18 @@ export default function rewindExtension(pi: ExtensionAPI) {
       pendingTreeState?.undoCommitSha,
     ].filter((commitSha): commitSha is string => Boolean(commitSha));
 
-    for (const commitSha of new Set([...currentCommits, ...undoCommits, ...inMemoryCommits])) {
-      if (budgetExceeded()) {
-        notify(ctx, `Rewind retention startup sweep skipped after exceeding ${startupBudgetMs}ms budget`, "warning");
-        return;
-      }
-      if (await commitExists(commitSha)) {
-        pinnedCommits.add(commitSha);
-      }
+    const pinCandidates = [...labeledCommits, ...currentCommits, ...undoCommits, ...inMemoryCommits];
+    // A session of a nested repository (submodule, vendored checkout) passes the cwd filter but
+    // references commits of its own repository; only commits this repository has may count.
+    const existingCommits = await getExistingCommits([...latestReferenceByCommit.keys(), ...pinCandidates]);
+    if (budgetExceeded()) {
+      notify(ctx, `Rewind retention startup sweep skipped after exceeding ${startupBudgetMs}ms budget`, "warning");
+      return;
     }
+    const pinnedCommits = new Set(pinCandidates.filter((commitSha) => existingCommits.has(commitSha)));
 
     let candidates = [...latestReferenceByCommit.entries()]
-      .filter(([commitSha]) => !pinnedCommits.has(commitSha))
+      .filter(([commitSha]) => existingCommits.has(commitSha) && !pinnedCommits.has(commitSha))
       .sort((left, right) => right[1] - left[1]);
 
     if (typeof retention.maxAgeDays === "number" && retention.maxAgeDays >= 0) {
@@ -1490,23 +1502,12 @@ export default function rewindExtension(pi: ExtensionAPI) {
     }
 
     const liveSet = new Set([...pinnedCommits, ...candidates.map(([commitSha]) => commitSha)]);
-    const existingLiveSet: string[] = [];
-    for (const commitSha of liveSet) {
-      if (budgetExceeded()) {
-        notify(ctx, `Rewind retention startup sweep skipped after exceeding ${startupBudgetMs}ms budget`, "warning");
-        return;
-      }
-      if (await commitExists(commitSha)) {
-        existingLiveSet.push(commitSha);
-      }
-    }
-
     const expiredCommits = new Set([...latestReferenceByCommit.keys()].filter((commitSha) => !liveSet.has(commitSha)));
     // Nothing to keep or drop: leave the sweep pending so a later one in this session still runs.
     if (liveSet.size === 0 && expiredCommits.size === 0) {
       return;
     }
-    await rewriteStore(existingLiveSet, expiredCommits);
+    await rewriteStore([...liveSet], expiredCommits);
 
     // Skip gc on background startup sweeps to avoid racing with concurrent snapshot creation
     if (reason !== "startup") {
