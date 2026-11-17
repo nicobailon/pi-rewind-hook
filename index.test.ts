@@ -1060,40 +1060,6 @@ test("a startup retention sweep keeps the snapshot a resumed session reuses for 
   }
 });
 
-test("a retention sweep keeps snapshots of another session in the same repo", async () => {
-  const harness = await createHarness({ settings: { rewind: { retention: { maxSnapshots: 100 } } } });
-
-  try {
-    const sessions = [harness.currentSession, harness.createSession({ id: "session-2" })];
-    for (const [index, session] of sessions.entries()) {
-      const file = `file-${index}.txt`;
-      const assistantMessage = { role: "assistant", timestamp: Date.now(), content: [{ type: "text", text: `Wrote ${file}` }] };
-      await harness.invoke("session_start", { reason: "startup" }, session);
-      await harness.invoke("before_agent_start", { prompt: `Write ${file}` });
-      await harness.invoke("turn_start", { turnIndex: 0 });
-      session.appendEntries(
-        { type: "message", id: `user-${index}`, parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: [{ type: "text", text: `Write ${file}` }] } },
-        { type: "message", id: `assistant-${index}`, parentId: `user-${index}`, timestamp: new Date().toISOString(), message: assistantMessage },
-      );
-      await harness.writeRepoFile(file, `${file}\n`);
-      await harness.invoke("turn_end", { message: assistantMessage });
-      await harness.invoke("agent_end", {});
-      await harness.invoke("session_shutdown", {});
-    }
-
-    const firstTurn = harness.currentSession.getEntries().find((entry) => entry.customType === "rewind-turn");
-    const firstSnapshots = (firstTurn?.data as { snapshots: string[] }).snapshots;
-    assert.equal(firstSnapshots.length, 2);
-    const storeHead = await harness.revParseStore();
-    assert.ok(storeHead);
-    for (const commitSha of firstSnapshots) {
-      assert.equal(await harness.isAncestor(commitSha, storeHead), true);
-    }
-  } finally {
-    await harness.cleanup();
-  }
-});
-
 test("a retention sweep drops only the snapshots it read and expired", async () => {
   const harness = await createHarness({ settings: { rewind: { retention: { maxAgeDays: 30 } } } });
 

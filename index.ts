@@ -260,9 +260,11 @@ function canonicalizePath(value: string): string {
 }
 
 function isInsidePath(targetPath: string, parentPath: string): boolean {
-  const resolvedTarget = canonicalizePath(targetPath);
-  const resolvedParent = canonicalizePath(parentPath);
-  const rel = relative(resolvedParent, resolvedTarget);
+  return isInsideCanonicalPath(canonicalizePath(targetPath), canonicalizePath(parentPath));
+}
+
+function isInsideCanonicalPath(targetPath: string, parentPath: string): boolean {
+  const rel = relative(parentPath, targetPath);
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
@@ -915,12 +917,6 @@ export default function rewindExtension(pi: ExtensionAPI) {
     throw new Error(`failed to update rewind store ref: ${detail}`);
   }
 
-  async function getStoreSnapshots(storeHead: string): Promise<string[]> {
-    // Snapshots are root commits; keepalive commits always have parents.
-    const result = await execGitChecked(["rev-list", "--max-parents=0", storeHead]);
-    return result.stdout.split("\n").filter(Boolean);
-  }
-
   async function rewriteStore(liveCommitShas: string[], expiredCommitShas: Set<string>): Promise<void> {
     let attempts = 0;
     let lastError: unknown;
@@ -930,7 +926,10 @@ export default function rewindExtension(pi: ExtensionAPI) {
       const oldHead = await getStoreHead();
       // Other sessions share the store, so only drop snapshots this sweep read and expired.
       // Members are re-read from the head the compare-and-swap uses, which keeps concurrent appends.
-      const members = oldHead ? await getStoreSnapshots(oldHead) : [];
+      // Snapshots are root commits; keepalive commits always have parents.
+      const members = oldHead
+        ? (await execGitChecked(["rev-list", "--max-parents=0", oldHead])).stdout.split("\n").filter(Boolean)
+        : [];
       const memberSet = new Set(members);
       const kept = members.filter((commitSha) => !expiredCommitShas.has(commitSha));
       const added = liveCommitShas.filter((commitSha) => !memberSet.has(commitSha));
@@ -944,13 +943,11 @@ export default function rewindExtension(pi: ExtensionAPI) {
       }
 
       try {
-        if (!head) {
+        if (head) {
+          await execGitChecked(["update-ref", STORE_REF, head, oldHead ?? LEGACY_ZERO_SHA]);
+        } else {
           // Every member expired, so nothing is left to keep alive.
           await execGitChecked(["update-ref", "-d", STORE_REF, oldHead!]);
-        } else if (oldHead) {
-          await execGitChecked(["update-ref", STORE_REF, head, oldHead]);
-        } else {
-          await execGitChecked(["update-ref", STORE_REF, head, LEGACY_ZERO_SHA]);
         }
         return;
       } catch (error) {
@@ -1330,14 +1327,6 @@ export default function rewindExtension(pi: ExtensionAPI) {
     }
   }
 
-  async function getWorktreePaths(): Promise<string[]> {
-    const result = await execGitChecked(["worktree", "list", "--porcelain"]);
-    return result.stdout
-      .split("\n")
-      .filter((line) => line.startsWith("worktree "))
-      .map((line) => line.slice("worktree ".length));
-  }
-
   // Every worktree of a repository shares refs/pi-rewind/store, so a sweep reads
   // every session whose cwd sits in any of them, not just the current lineage.
   async function discoverSessionFiles(isInsideRepo: (cwd: string) => boolean): Promise<string[]> {
@@ -1414,8 +1403,14 @@ export default function rewindExtension(pi: ExtensionAPI) {
 
     const budgetExceeded = () => typeof startupBudgetMs === "number" && Date.now() - startedAt > startupBudgetMs;
 
-    const worktreePaths = await getWorktreePaths();
-    const isInsideRepo = (cwd: string) => worktreePaths.some((worktreePath) => isInsidePath(cwd, worktreePath));
+    const worktreePaths = (await execGitChecked(["worktree", "list", "--porcelain"])).stdout
+      .split("\n")
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => canonicalizePath(line.slice("worktree ".length)));
+    const isInsideRepo = (cwd: string) => {
+      const target = canonicalizePath(cwd);
+      return worktreePaths.some((worktreePath) => isInsideCanonicalPath(target, worktreePath));
+    };
     const sessionFiles = await discoverSessionFiles(isInsideRepo);
     if (budgetExceeded()) {
       notify(ctx, `Rewind retention startup sweep skipped after exceeding ${startupBudgetMs}ms budget`, "warning");
