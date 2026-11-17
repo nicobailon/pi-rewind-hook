@@ -4,13 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.8.9] - 2026-11-17
+
+### Highlights
+- With retention turned on, Rewind no longer loses restore points from your other sessions in the same project. This includes forked sessions and sessions started in a linked worktree.
+- Resuming an older session and sending a prompt keeps that prompt's file restore point, even after `git gc`.
+- Rewind works in Pi hosts whose UI has no theme, such as pi-web-ui, instead of showing a warning after every prompt.
+
 ### Fixed
-- Rewind no longer shows a "failed to finalize rewind turn" warning after every prompt and session switch in hosts whose UI has no theme, such as pi-web-ui. The status line falls back to plain text. Thanks to [@wu546526](https://github.com/wu546526) for reporting and diagnosing #24.
-- Resuming a session whose files haven't changed keeps the restore point of its next prompt when retention is on. Before, the startup retention sweep could drop that snapshot and `git gc` could then delete it. Thanks to [@w-winter](https://github.com/w-winter) for reporting and diagnosing #26.
-- Retention sweeps no longer drop snapshots that other sessions in the same repository still use, including forked sessions and sessions started in a linked worktree. Before, each sweep read only the current session and its parents and kept just their snapshots, so the next `git gc` could delete the restore points of every other session. A sweep now reads every session of the repository and only removes snapshots it read and found expired. Thanks to [@w-winter](https://github.com/w-winter) for reporting and diagnosing #25.
+- With retention on, Rewind keeps the file snapshots that your other sessions in the same repository still use, including forked sessions and sessions in a linked worktree. Before, Rewind only protected the current session and the sessions it was forked from, so `git gc` could delete the restore points of every other session. Rewind now checks every session of the repository and only lets go of snapshots that are past your retention limits. Thanks to [@w-winter](https://github.com/w-winter) for reporting and diagnosing #25.
+- When you resume a session whose files haven't changed and send a prompt, that prompt keeps its file restore point with retention on. Before, cleanup at startup could drop the snapshot it reuses, and `git gc` could then delete it. Thanks to [@w-winter](https://github.com/w-winter) for reporting and diagnosing #26.
+- In hosts whose UI has no theme, such as pi-web-ui, Rewind no longer shows a "failed to finalize rewind turn" warning after every prompt and session switch. The status line shows plain text instead. Thanks to [@wu546526](https://github.com/wu546526) for reporting and diagnosing #24.
 
 ### Removed
-- `rewind.retention.scanMode` is removed. Every retention sweep now reads all sessions of the repository, including sessions in its linked worktrees.
+- The `rewind.retention.scanMode` setting is gone. Rewind now always checks every session of the repository, including sessions in its linked worktrees. If your settings still have it, Rewind ignores it and you don't need to change anything.
 
 ## [1.8.8] - 2026-10-31
 
